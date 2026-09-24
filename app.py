@@ -1,19 +1,24 @@
+import gc
 import io
 import time
 
-import numpy as np
 import streamlit as st
 import torch
 import soundfile as sf
 
 from PIL import Image
+
 from transformers import (
-    AutoProcessor,
-    AutoModelForMultimodalLM,
+    BlipProcessor,
+    BlipForConditionalGeneration,
     AutoTokenizer,
     AutoModelForCausalLM,
-    pipeline,
+    SpeechT5Processor,
+    SpeechT5ForTextToSpeech,
+    SpeechT5HifiGan,
 )
+
+from datasets import load_dataset
 
 
 # ============================================================
@@ -21,7 +26,7 @@ from transformers import (
 # ============================================================
 
 st.set_page_config(
-    page_title="My Story Maker",
+    page_title="🌈 My Story Maker",
     page_icon="🌈",
     layout="centered",
 )
@@ -31,12 +36,20 @@ st.set_page_config(
 # MODEL CONFIGURATION
 # ============================================================
 
-VISION_MODEL = "HuggingFaceTB/SmolVLM-500M-Instruct"
-TEXT_MODEL = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
-TTS_MODEL = "microsoft/speecht5_tts"
+# Image → Text
+VISION_MODEL = "Salesforce/blip-image-captioning-base"
 
-# SpeechT5 speaker embeddings
+# Text → Story
+TEXT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
+
+# Text → Speech
+TTS_MODEL = "microsoft/speecht5_tts"
+TTS_VOCODER = "microsoft/speecht5_hifigan"
+
+# Public speaker-embedding dataset used by SpeechT5.
 SPEAKER_DATASET = "Matthijs/cmu-arctic-xvectors"
+
+# One of the voices in the dataset.
 SPEAKER_INDEX = 7306
 
 
@@ -44,280 +57,463 @@ SPEAKER_INDEX = 7306
 # DEVICE
 # ============================================================
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-if DEVICE == "cuda":
-    DTYPE = torch.bfloat16
-else:
-    DTYPE = torch.float32
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
 
 
 # ============================================================
-# LOAD VISION MODEL
+# HELPER: CLEAN UP MEMORY
 # ============================================================
 
-@st.cache_resource
-def load_vision_model():
+def cleanup_memory():
 
-    processor = AutoProcessor.from_pretrained(
-        VISION_MODEL
-    )
+    gc.collect()
 
-    model = AutoModelForMultimodalLM.from_pretrained(
-    VISION_MODEL,
-    torch_dtype=DTYPE,
-    )
-
-    model.to(DEVICE)
-
-    return processor, model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 # ============================================================
-# LOAD TEXT MODEL
+# IMAGE → TEXT
 # ============================================================
 
-@st.cache_resource
-def load_vision_model():
+def image_to_text(image):
 
-    return pipeline(
-        "image-text-to-text",
-        model=VISION_MODEL,
-    )
+    processor = None
+    model = None
 
+    try:
 
+        processor = BlipProcessor.from_pretrained(
+            VISION_MODEL
+        )
 
-# ============================================================
-# LOAD TEXT-TO-SPEECH MODEL
-# ============================================================
+        model = BlipForConditionalGeneration.from_pretrained(
+            VISION_MODEL
+        )
 
-@st.cache_resource
-def load_tts_model():
+        model.to(DEVICE)
+        model.eval()
 
-    synthesizer = pipeline(
-        "text-to-speech",
-        model=TTS_MODEL,
-    )
+        # BLIP is an image-captioning model rather than a
+        # general vision-language model.
+        prompt = (
+            "a friendly picture of"
+        )
 
-    return synthesizer
+        inputs = processor(
+            images=image,
+            text=prompt,
+            return_tensors="pt",
+        )
 
-
-# ============================================================
-# IMAGE → DESCRIPTION
-# ============================================================
-
-def image_to_text(image, model):
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                },
-                {
-                    "type": "text",
-                    "text": (
-                        "Describe this picture for a young child. "
-                        "Use simple, friendly words. "
-                        "Mention the main people, animals, "
-                        "objects, colors, and actions you can see. "
-                        "Do not guess names, ages, locations, "
-                        "or other private information."
-                    ),
-                },
-            ],
+        inputs = {
+            key: value.to(DEVICE)
+            for key, value in inputs.items()
         }
-    ]
 
-    result = model(
-        text=messages,
-        max_new_tokens=80,
-        return_full_text=False,
-    )
+        with torch.no_grad():
 
-    return result[0]["generated_text"]
+            output = model.generate(
+                **inputs,
+                max_new_tokens=40,
+                num_beams=3,
+                early_stopping=True,
+            )
 
+        description = processor.decode(
+            output[0],
+            skip_special_tokens=True,
+        )
+
+        return description.strip()
+
+    finally:
+
+        # Don't keep the vision model in RAM.
+        del model
+        del processor
+
+        cleanup_memory()
 
 
 # ============================================================
-# GENERATE CHILD-FRIENDLY STORY
+# STORY GENERATION
 # ============================================================
 
 def generate_story(
     description,
-    tokenizer,
-    model,
     age_group,
     story_style,
 ):
 
-    if age_group == "3–5":
+    tokenizer = None
+    model = None
 
-        length_instruction = """
-Write 3–5 very short sentences.
-Use very simple vocabulary.
-Use a warm, playful tone.
-"""
+    try:
 
-    elif age_group == "6–7":
+        tokenizer = AutoTokenizer.from_pretrained(
+            TEXT_MODEL
+        )
 
-        length_instruction = """
-Write 6–8 short sentences.
-Use simple vocabulary and a little imagination.
-"""
+        model = AutoModelForCausalLM.from_pretrained(
+            TEXT_MODEL
+        )
 
-    else:
+        model.to(DEVICE)
+        model.eval()
 
-        length_instruction = """
-Write 8–12 sentences.
-Use vivid but age-appropriate language.
-Include a small adventure and a happy or reassuring ending.
-"""
+        # ----------------------------------------------------
+        # Story length
+        # ----------------------------------------------------
 
-    style_instructions = {
-        "🐉 Magical": "Add gentle magical elements such as friendly dragons, fairies, or enchanted places.",
-        "🚀 Adventure": "Make the story feel like a fun, safe adventure.",
-        "🐾 Animal": "Include friendly animals as important characters.",
-        "😂 Funny": "Include something silly or surprising that is appropriate for children.",
-    }
+        if age_group == "3–5":
 
-    style_instruction = style_instructions[story_style]
+            length = (
+                "Write 3 to 5 very short sentences. "
+                "Use very simple words."
+            )
 
-    prompt = f"""
+        elif age_group == "6–7":
+
+            length = (
+                "Write 5 to 7 short sentences. "
+                "Use simple words and playful descriptions."
+            )
+
+        else:
+
+            length = (
+                "Write 7 to 10 sentences. "
+                "Use imaginative but easy-to-understand language."
+            )
+
+        # ----------------------------------------------------
+        # Story style
+        # ----------------------------------------------------
+
+        styles = {
+
+            "🐉 Magical":
+                "Make it a gentle magical adventure.",
+
+            "🚀 Adventure":
+                "Make it a fun and safe adventure.",
+
+            "🐾 Animal":
+                "Make friendly animals important characters.",
+
+            "😂 Funny":
+                "Include something silly and funny.",
+        }
+
+        style_instruction = styles.get(
+            story_style,
+            "Make it a warm children's story.",
+        )
+
+        # ----------------------------------------------------
+        # Prompt
+        # ----------------------------------------------------
+
+        prompt = f"""
 You are a children's story writer.
 
-Create a safe, kind and imaginative story for a child.
+Create a kind, imaginative story for a child.
 
-The picture shows:
+The picture description is:
 
 {description}
 
-Age group:
-{age_group}
+The child is in the {age_group} age group.
 
-Story style:
-{story_style}
-
-{length_instruction}
+{length}
 
 {style_instruction}
 
-Rules:
-- The story must be suitable for children.
-- No violence.
-- No frightening scenes.
-- No weapons.
-- No dangerous instructions.
-- No adult themes.
-- No bullying.
-- Do not mention that you are an AI.
-- Do not talk about the prompt.
-- Do not invent personal information about people in the picture.
-- Give the story a positive or reassuring ending.
+Important rules:
 
-Write only the story.
+- The story must be safe for children.
+- Do not include violence.
+- Do not include weapons.
+- Do not include scary or frightening scenes.
+- Do not include adult topics.
+- Do not include bullying.
+- Do not include dangerous instructions.
+- Do not mention being an AI.
+- Do not talk about the instructions.
+- Do not invent names or personal information about people.
+- End the story in a happy, warm, or reassuring way.
+- Write only the story.
+
+Story:
 """
 
-    messages = [
-        {
-            "role": "user",
-            "content": prompt,
-        }
-    ]
-
-    input_text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    inputs = tokenizer(
-        input_text,
-        return_tensors="pt",
-    )
-
-    inputs = {
-        key: value.to(DEVICE)
-        for key, value in inputs.items()
-    }
-
-    with torch.no_grad():
-
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=180,
-            temperature=0.7,
-            do_sample=True,
-            top_p=0.9,
-        )
-
-    generated_text = tokenizer.decode(
-        generated_ids[0],
-        skip_special_tokens=True,
-    )
-
-    # Try to remove the original prompt from the result.
-    if generated_text.startswith(input_text):
-        generated_text = generated_text[
-            len(input_text):
+        messages = [
+            {
+                "role": "user",
+                "content": prompt,
+            }
         ]
 
-    return generated_text.strip()
+        input_text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        inputs = tokenizer(
+            input_text,
+            return_tensors="pt",
+        )
+
+        inputs = {
+            key: value.to(DEVICE)
+            for key, value in inputs.items()
+        }
+
+        # ----------------------------------------------------
+        # Generate
+        # ----------------------------------------------------
+
+        with torch.no_grad():
+
+            output = model.generate(
+                **inputs,
+                max_new_tokens=140,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9,
+                repetition_penalty=1.1,
+            )
+
+        # Only decode the newly generated tokens.
+        generated_tokens = output[
+            0,
+            inputs["input_ids"].shape[1]:
+        ]
+
+        story = tokenizer.decode(
+            generated_tokens,
+            skip_special_tokens=True,
+        )
+
+        story = story.strip()
+
+        # ----------------------------------------------------
+        # Safety-oriented cleanup
+        # ----------------------------------------------------
+
+        if story.lower().startswith("story:"):
+
+            story = story[6:].strip()
+
+        return story
+
+    finally:
+
+        del model
+        del tokenizer
+
+        cleanup_memory()
 
 
 # ============================================================
 # TEXT → SPEECH
 # ============================================================
 
-def text_to_speech(text, synthesizer):
+def text_to_speech(text):
 
-    speech = synthesizer(text)
+    processor = None
+    model = None
+    vocoder = None
+    embeddings_dataset = None
 
-    audio = speech["audio"]
+    try:
 
-    # Transformers may return [1, samples].
-    if len(audio.shape) == 2:
-        audio = audio[0]
+        # ----------------------------------------------------
+        # Load SpeechT5
+        # ----------------------------------------------------
 
-    sample_rate = speech["sampling_rate"]
+        processor = SpeechT5Processor.from_pretrained(
+            TTS_MODEL
+        )
 
-    buffer = io.BytesIO()
+        model = SpeechT5ForTextToSpeech.from_pretrained(
+            TTS_MODEL
+        )
 
-    sf.write(
-        buffer,
-        audio,
-        sample_rate,
-        format="WAV",
-    )
+        vocoder = SpeechT5HifiGan.from_pretrained(
+            TTS_VOCODER
+        )
 
-    buffer.seek(0)
+        model.to(DEVICE)
+        vocoder.to(DEVICE)
 
-    return buffer.read()
+        model.eval()
+        vocoder.eval()
+
+        # ----------------------------------------------------
+        # Speaker embedding
+        # ----------------------------------------------------
+
+        embeddings_dataset = load_dataset(
+            SPEAKER_DATASET,
+            split="validation",
+        )
+
+        speaker_embedding = torch.tensor(
+            embeddings_dataset[SPEAKER_INDEX]["xvector"]
+        ).unsqueeze(0)
+
+        speaker_embedding = speaker_embedding.to(
+            DEVICE
+        )
+
+        # ----------------------------------------------------
+        # Prepare text
+        # ----------------------------------------------------
+
+        inputs = processor(
+            text=text,
+            return_tensors="pt",
+        )
+
+        input_ids = inputs["input_ids"].to(
+            DEVICE
+        )
+
+        # ----------------------------------------------------
+        # Generate speech
+        # ----------------------------------------------------
+
+        with torch.no_grad():
+
+            speech = model.generate_speech(
+                input_ids,
+                speaker_embedding,
+                vocoder=vocoder,
+            )
+
+        # ----------------------------------------------------
+        # Convert to WAV
+        # ----------------------------------------------------
+
+        audio_buffer = io.BytesIO()
+
+        sf.write(
+            audio_buffer,
+            speech.cpu().numpy(),
+            16000,
+            format="WAV",
+        )
+
+        audio_buffer.seek(0)
+
+        return audio_buffer.read()
+
+    finally:
+
+        del model
+        del processor
+        del vocoder
+        del embeddings_dataset
+
+        cleanup_memory()
 
 
 # ============================================================
-# MAIN STREAMLIT APPLICATION
+# RESET APP
+# ============================================================
+
+def reset_story():
+
+    keys_to_remove = [
+        "description",
+        "story",
+        "audio",
+    ]
+
+    for key in keys_to_remove:
+
+        if key in st.session_state:
+
+            del st.session_state[key]
+
+
+# ============================================================
+# CHILD-FRIENDLY STYLING
+# ============================================================
+
+def add_custom_css():
+
+    st.markdown(
+        """
+        <style>
+
+        .main-title {
+            text-align: center;
+            font-size: 42px;
+            font-weight: 800;
+            color: #6C63FF;
+            margin-bottom: 5px;
+        }
+
+        .subtitle {
+            text-align: center;
+            font-size: 20px;
+            color: #555555;
+            margin-bottom: 25px;
+        }
+
+        .story-box {
+            background-color: #FFF8E7;
+            border-radius: 20px;
+            padding: 25px;
+            margin-top: 15px;
+            margin-bottom: 20px;
+            border: 2px solid #FFE4A3;
+            font-size: 20px;
+            line-height: 1.7;
+        }
+
+        .idea-box {
+            background-color: #F0F7FF;
+            border-radius: 18px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# MAIN
 # ============================================================
 
 def main():
+
+    add_custom_css()
 
     # --------------------------------------------------------
     # Header
     # --------------------------------------------------------
 
     st.markdown(
-        """
-        <div style="text-align:center">
+        '<div class="main-title">'
+        '🌈 My Story Maker 🌈'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
-        <h1>🌈 My Story Maker 🌈</h1>
-
-        <p style="font-size:20px;">
-        Turn a picture into a magical story!
-        </p>
-
-        </div>
-        """,
+    st.markdown(
+        '<div class="subtitle">'
+        'Turn a picture into a magical story!'
+        '</div>',
         unsafe_allow_html=True,
     )
 
@@ -332,18 +528,22 @@ def main():
     with col1:
 
         age_group = st.selectbox(
-            "How long should the story be?",
+            "Story size",
             [
                 "3–5",
                 "6–7",
                 "8–10",
             ],
+            help=(
+                "This controls how long and complex "
+                "the story will be."
+            ),
         )
 
     with col2:
 
         story_style = st.selectbox(
-            "What kind of story?",
+            "Story type",
             [
                 "🐉 Magical",
                 "🚀 Adventure",
@@ -353,13 +553,13 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Image upload
+    # Upload
     # --------------------------------------------------------
 
-    st.subheader("📸 Pick a picture")
+    st.subheader("📸 Choose a picture")
 
     uploaded_file = st.file_uploader(
-        "Choose a picture",
+        "Upload a picture",
         type=[
             "jpg",
             "jpeg",
@@ -371,23 +571,22 @@ def main():
 
     if uploaded_file is None:
 
-        st.info(
-            "👆 Choose a picture to begin your adventure!"
-        )
-
         st.markdown(
             """
-            ### 💡 Ideas
+            <div class="idea-box">
 
-            Try a picture of:
+            <h3>💡 Try a picture of...</h3>
 
-            - 🧸 Your favorite toy
-            - 🐶 A pet
-            - 🌳 A park
-            - 🏰 A castle
-            - 🚲 A bike
-            - 🎨 A drawing
-            """
+            🧸 Your favorite toy<br>
+            🐶 A pet<br>
+            🌳 A park<br>
+            🏰 A castle<br>
+            🚲 A bike<br>
+            🎨 A drawing
+
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
         return
@@ -396,7 +595,20 @@ def main():
     # Open image
     # --------------------------------------------------------
 
-    image = Image.open(uploaded_file).convert("RGB")
+    try:
+
+        image = Image.open(
+            uploaded_file
+        ).convert("RGB")
+
+    except Exception:
+
+        st.error(
+            "Hmm... I couldn't open that picture. "
+            "Please try another image."
+        )
+
+        return
 
     st.image(
         image,
@@ -405,7 +617,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Generate story
+    # Make story button
     # --------------------------------------------------------
 
     if st.button(
@@ -415,7 +627,7 @@ def main():
     ):
 
         # ----------------------------------------------------
-        # Load vision model
+        # IMAGE → TEXT
         # ----------------------------------------------------
 
         with st.spinner(
@@ -424,28 +636,20 @@ def main():
 
             start = time.perf_counter()
 
-            processor, vision_model = (
-                load_vision_model()
-            )
-
             description = image_to_text(
-                image,
-                processor,
-                vision_model,
+                image
             )
 
-            vision_time = (
+            elapsed = (
                 time.perf_counter() - start
             )
 
-        # ----------------------------------------------------
-        # Show description
-        # ----------------------------------------------------
-
-        st.session_state["description"] = description
+        st.session_state[
+            "description"
+        ] = description
 
         # ----------------------------------------------------
-        # Generate story
+        # TEXT → STORY
         # ----------------------------------------------------
 
         with st.spinner(
@@ -454,31 +658,26 @@ def main():
 
             start = time.perf_counter()
 
-            tokenizer, text_model = (
-                load_text_model()
-            )
-
             story = generate_story(
                 description,
-                tokenizer,
-                text_model,
                 age_group,
                 story_style,
             )
 
-            story_time = (
+            elapsed_story = (
                 time.perf_counter() - start
             )
 
-        st.session_state["story"] = story
+        st.session_state[
+            "story"
+        ] = story
 
-        st.session_state["timings"] = {
-            "vision": vision_time,
-            "story": story_time,
-        }
+        st.session_state[
+            "audio"
+        ] = None
 
     # --------------------------------------------------------
-    # Display description
+    # IMAGE DESCRIPTION
     # --------------------------------------------------------
 
     if "description" in st.session_state:
@@ -492,7 +691,7 @@ def main():
             )
 
     # --------------------------------------------------------
-    # Display story
+    # STORY
     # --------------------------------------------------------
 
     if "story" in st.session_state:
@@ -503,13 +702,7 @@ def main():
 
         st.markdown(
             f"""
-            <div style="
-                background-color:#FFF8E7;
-                padding:25px;
-                border-radius:20px;
-                font-size:20px;
-                line-height:1.7;
-            ">
+            <div class="story-box">
             {st.session_state["story"]}
             </div>
             """,
@@ -517,10 +710,8 @@ def main():
         )
 
         # ----------------------------------------------------
-        # Read story aloud
+        # READ STORY
         # ----------------------------------------------------
-
-        st.write("")
 
         if st.button(
             "🔊 Read My Story",
@@ -531,20 +722,43 @@ def main():
                 "🎵 Getting the story ready..."
             ):
 
-                tts_model = load_tts_model()
+                try:
 
-                audio = text_to_speech(
-                    st.session_state["story"],
-                    tts_model,
-                )
+                    audio = text_to_speech(
+                        st.session_state["story"]
+                    )
+
+                    st.session_state[
+                        "audio"
+                    ] = audio
+
+                except Exception as error:
+
+                    st.warning(
+                        "I couldn't make the audio "
+                        "right now. You can still read "
+                        "the story! 😊"
+                    )
+
+                    st.session_state[
+                        "audio"
+                    ] = None
+
+        # ----------------------------------------------------
+        # AUDIO PLAYER
+        # ----------------------------------------------------
+
+        if st.session_state.get(
+            "audio"
+        ):
 
             st.audio(
-                audio,
+                st.session_state["audio"],
                 format="audio/wav",
             )
 
         # ----------------------------------------------------
-        # Start over
+        # NEW STORY
         # ----------------------------------------------------
 
         st.write("")
@@ -554,21 +768,13 @@ def main():
             use_container_width=True,
         ):
 
-            for key in [
-                "description",
-                "story",
-                "timings",
-            ]:
-                st.session_state.pop(
-                    key,
-                    None,
-                )
+            reset_story()
 
             st.rerun()
 
 
 # ============================================================
-# APPLICATION ENTRY POINT
+# ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
