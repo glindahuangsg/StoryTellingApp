@@ -1,14 +1,21 @@
 # =====================================================================================
 # requirements.txt — Python dependencies for "Story Time!"
 # Pinned to versions known to work together on Streamlit Cloud (Python 3.11 runtime).
+#
+# IMPORTANT: the --extra-index-url line below makes pip fetch the CPU-only build of
+# PyTorch (~200MB) instead of the default PyPI wheel (which bundles CUDA support and
+# is 800MB-2GB+). The full wheel routinely times out or runs out of memory during a
+# Streamlit Community Cloud build, which is the most common cause of a deploy failing
+# with "installer returned a non-zero exit code" for an app like this one.
 # =====================================================================================
+--extra-index-url https://download.pytorch.org/whl/cpu
 
 # --- Web app framework -------------------------------------------------------------
 streamlit==1.38.0
 
 # --- Hugging Face model pipelines (image captioning + text generation) -------------
 transformers==4.44.2
-torch==2.4.1
+torch==2.4.1+cpu
 sentencepiece==0.2.0      # required tokenizer backend for the flan-t5 model
 accelerate==0.34.2        # speeds up / simplifies model loading on CPU
 
