@@ -45,8 +45,12 @@ Pillow>=11,<13
 # The Hugging Face text-to-speech pipeline (facebook/mms-tts-eng) returns raw audio
 # samples as a numpy array, not an audio file — soundfile encodes those samples into
 # a WAV file in memory so Streamlit can play/download it.
+#
+# NOTE: the `datasets` package was briefly added here to load a specific voice's
+# speaker embedding for microsoft/speecht5_tts, but was removed again — `datasets`
+# pulls in `dill` for cache fingerprinting, and that version of `dill` is incompatible
+# with a pickle-internals change in Python 3.14 (Streamlit Cloud's runtime), crashing
+# with "TypeError: Pickler._batch_setitems() takes 2 positional arguments but 3 were
+# given" on every run. facebook/mms-tts-eng needs no such dependency.
 numpy>=1.24,<3
 soundfile>=0.12,<1
-
-
-datasets>=2.19,<4
