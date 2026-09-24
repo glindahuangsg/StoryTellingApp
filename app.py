@@ -1,6 +1,7 @@
 import gc
 import io
 import re
+import zipfile
 
 import numpy as np
 import soundfile as sf
@@ -28,15 +29,13 @@ from huggingface_hub import hf_hub_download
 
 VISION_MODEL = "Salesforce/blip-image-captioning-base"
 
-# Small enough for Streamlit Cloud CPU.
+# Small model suitable for Streamlit Cloud CPU.
 TEXT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 
 TTS_MODEL = "microsoft/speecht5_tts"
-
 TTS_VOCODER = "microsoft/speecht5_hifigan"
 
 SPEAKER_REPO = "Matthijs/cmu-arctic-xvectors"
-
 SPEAKER_INDEX = 7306
 
 SAMPLE_RATE = 16000
@@ -52,7 +51,7 @@ DEVICE = torch.device(
 
 
 # ============================================================
-# PAGE CONFIG
+# STREAMLIT
 # ============================================================
 
 st.set_page_config(
@@ -82,7 +81,7 @@ def add_custom_css():
 
         .subtitle {
             text-align: center;
-            color: #666666;
+            color: #666;
             font-size: 19px;
             margin-bottom: 25px;
         }
@@ -93,7 +92,7 @@ def add_custom_css():
             border-radius: 20px;
             padding: 25px;
             font-size: 20px;
-            line-height: 1.7;
+            line-height: 1.8;
             margin-top: 15px;
             margin-bottom: 20px;
         }
@@ -120,7 +119,6 @@ def cleanup_memory():
     gc.collect()
 
     if torch.cuda.is_available():
-
         torch.cuda.empty_cache()
 
 
@@ -132,17 +130,9 @@ def cleanup_memory():
 def load_speaker_embedding():
 
     """
-    Load one SpeechT5 speaker embedding.
+    Download the CMU Arctic x-vector archive directly.
 
-    IMPORTANT:
-    We do not use datasets.load_dataset().
-
-    The original CMU Arctic repository contains an old
-    dataset-loading Python script that causes:
-
-        Dataset scripts are no longer supported
-
-    Instead, we download the x-vector archive directly.
+    We deliberately do NOT use datasets.load_dataset().
     """
 
     zip_path = hf_hub_download(
@@ -151,29 +141,29 @@ def load_speaker_embedding():
         repo_type="dataset",
     )
 
-    import zipfile
-
     with zipfile.ZipFile(
         zip_path,
         "r",
     ) as archive:
 
-        npy_files = [
-            name
-            for name in archive.namelist()
-            if name.endswith(".npy")
-        ]
-
-        npy_files.sort()
+        npy_files = sorted(
+            [
+                name
+                for name in archive.namelist()
+                if name.endswith(".npy")
+            ]
+        )
 
         if SPEAKER_INDEX >= len(npy_files):
 
             raise RuntimeError(
-                f"Speaker index {SPEAKER_INDEX} is unavailable. "
-                f"Found {len(npy_files)} speaker files."
+                f"Speaker index {SPEAKER_INDEX} unavailable. "
+                f"Found {len(npy_files)} files."
             )
 
-        selected_file = npy_files[SPEAKER_INDEX]
+        selected_file = npy_files[
+            SPEAKER_INDEX
+        ]
 
         with archive.open(
             selected_file
@@ -187,7 +177,6 @@ def load_speaker_embedding():
     )
 
     if embedding.ndim == 1:
-
         embedding = embedding.unsqueeze(0)
 
     if embedding.shape != (1, 512):
@@ -202,73 +191,85 @@ def load_speaker_embedding():
 
 
 # ============================================================
-# IMAGE → TEXT
+# IMAGE → DESCRIPTION
 # ============================================================
+
+@st.cache_resource
+def load_vision_model():
+
+    processor = BlipProcessor.from_pretrained(
+        VISION_MODEL
+    )
+
+    model = BlipForConditionalGeneration.from_pretrained(
+        VISION_MODEL
+    )
+
+    model.to(DEVICE)
+    model.eval()
+
+    return processor, model
+
 
 def image_to_text(image):
 
-    processor = None
-    model = None
+    processor, model = load_vision_model()
 
-    try:
+    inputs = processor(
+        images=image,
+        text="a picture of",
+        return_tensors="pt",
+    )
 
-        processor = BlipProcessor.from_pretrained(
-            VISION_MODEL
+    inputs = {
+        key: value.to(DEVICE)
+        for key, value in inputs.items()
+    }
+
+    with torch.no_grad():
+
+        output = model.generate(
+            **inputs,
+            max_new_tokens=40,
+            num_beams=3,
         )
 
-        model = BlipForConditionalGeneration.from_pretrained(
-            VISION_MODEL
-        )
+    description = processor.decode(
+        output[0],
+        skip_special_tokens=True,
+    )
 
-        model.to(DEVICE)
-        model.eval()
-
-        inputs = processor(
-            images=image,
-            text="a picture of",
-            return_tensors="pt",
-        )
-
-        inputs = {
-            key: value.to(DEVICE)
-            for key, value in inputs.items()
-        }
-
-        with torch.no_grad():
-
-            output = model.generate(
-                **inputs,
-                max_new_tokens=40,
-                num_beams=3,
-            )
-
-        description = processor.decode(
-            output[0],
-            skip_special_tokens=True,
-        )
-
-        return description.strip()
-
-    finally:
-
-        del model
-        del processor
-
-        cleanup_memory()
+    return description.strip()
 
 
 # ============================================================
-# TEXT CLEANING
+# TEXT MODEL
 # ============================================================
 
-def clean_story_text(text):
+@st.cache_resource
+def load_text_model():
 
-    """
-    Clean common artifacts produced by small language models.
-    """
+    tokenizer = AutoTokenizer.from_pretrained(
+        TEXT_MODEL
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        TEXT_MODEL
+    )
+
+    model.to(DEVICE)
+    model.eval()
+
+    return tokenizer, model
+
+
+# ============================================================
+# SENTENCE CLEANING
+# ============================================================
+
+def clean_sentence(text):
 
     if not text:
-
         return ""
 
     text = text.strip()
@@ -278,10 +279,11 @@ def clean_story_text(text):
     prefixes = [
         "Story:",
         "story:",
-        "Here is the story:",
-        "Here is a story:",
-        "Here’s the story:",
-        "Here’s a story:",
+        "Sentence:",
+        "sentence:",
+        "Next sentence:",
+        "Next:",
+        "The next sentence is:",
     ]
 
     for prefix in prefixes:
@@ -292,7 +294,13 @@ def clean_story_text(text):
                 len(prefix):
             ].strip()
 
-    # Remove markdown headings.
+    # Remove markdown.
+
+    text = re.sub(
+        r"^[-*]\s*",
+        "",
+        text,
+    )
 
     text = re.sub(
         r"^#+\s*",
@@ -300,7 +308,7 @@ def clean_story_text(text):
         text,
     )
 
-    # Normalize whitespace.
+    # Convert newlines to spaces.
 
     text = re.sub(
         r"\s+",
@@ -308,217 +316,137 @@ def clean_story_text(text):
         text,
     ).strip()
 
-    return text
+    # If model generated multiple sentences,
+    # keep only the first complete sentence.
 
-
-# ============================================================
-# SENTENCE SPLITTING
-# ============================================================
-
-def split_sentences(text):
-
-    """
-    Split English children's story into sentences.
-    """
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    ).strip()
-
-    if not text:
-
-        return []
-
-    sentences = re.split(
-        r"(?<=[.!?])\s+",
+    match = re.search(
+        r"^(.+?[.!?])(?:\s|$)",
         text,
     )
 
-    return [
-        sentence.strip()
-        for sentence in sentences
-        if sentence.strip()
+    if match:
+
+        text = match.group(1)
+
+    # Make sure sentence has punctuation.
+
+    if text and text[-1] not in ".!?":
+
+        text += "."
+
+    return text.strip()
+
+
+# ============================================================
+# SENTENCE DUPLICATE CHECK
+# ============================================================
+
+def normalize_sentence(text):
+
+    text = text.lower()
+
+    text = re.sub(
+        r"[^a-z0-9\s]",
+        "",
+        text,
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
+
+    return text.strip()
+
+
+def is_duplicate_sentence(
+    sentence,
+    existing_sentences,
+):
+
+    normalized = normalize_sentence(
+        sentence
+    )
+
+    if not normalized:
+        return True
+
+    for previous in existing_sentences:
+
+        previous_normalized = normalize_sentence(
+            previous
+        )
+
+        if normalized == previous_normalized:
+
+            return True
+
+    return False
+
+
+# ============================================================
+# GENERATE ONE SENTENCE
+# ============================================================
+
+def generate_one_sentence(
+    tokenizer,
+    model,
+    prompt,
+    max_new_tokens=45,
+):
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=850,
+    )
+
+    inputs = {
+        key: value.to(DEVICE)
+        for key, value in inputs.items()
+    }
+
+    with torch.no_grad():
+
+        output = model.generate(
+            **inputs,
+
+            max_new_tokens=max_new_tokens,
+
+            min_new_tokens=8,
+
+            do_sample=True,
+
+            temperature=0.65,
+
+            top_p=0.88,
+
+            repetition_penalty=1.18,
+
+            no_repeat_ngram_size=4,
+
+            eos_token_id=tokenizer.eos_token_id,
+
+            pad_token_id=(
+                tokenizer.pad_token_id
+                if tokenizer.pad_token_id is not None
+                else tokenizer.eos_token_id
+            ),
+        )
+
+    generated_tokens = output[
+        0,
+        inputs["input_ids"].shape[1]:
     ]
 
-
-# ============================================================
-# REMOVE REPEATED SENTENCES
-# ============================================================
-
-def remove_repeated_sentences(
-    sentences,
-):
-
-    """
-    Remove exact or near-exact repeated sentences.
-
-    This is particularly useful with small language models
-    which sometimes generate:
-
-        The dog ran home.
-        The dog ran home.
-        The dog ran home.
-
-    or slightly modified repetitions.
-    """
-
-    result = []
-
-    seen = set()
-
-    for sentence in sentences:
-
-        normalized = sentence.lower()
-
-        normalized = re.sub(
-            r"[^a-z0-9\s]",
-            "",
-            normalized,
-        )
-
-        normalized = re.sub(
-            r"\s+",
-            " ",
-            normalized,
-        ).strip()
-
-        if not normalized:
-
-            continue
-
-        # Exact duplicate.
-
-        if normalized in seen:
-
-            continue
-
-        # Detect immediate repetition of a sentence.
-        if result:
-
-            previous = result[-1]
-
-            previous_normalized = re.sub(
-                r"[^a-z0-9\s]",
-                "",
-                previous.lower(),
-            )
-
-            previous_normalized = re.sub(
-                r"\s+",
-                " ",
-                previous_normalized,
-            ).strip()
-
-            if (
-                normalized == previous_normalized
-            ):
-
-                continue
-
-        seen.add(normalized)
-
-        result.append(sentence)
-
-    return result
-
-
-# ============================================================
-# FINALIZE STORY
-# ============================================================
-
-def finalize_story(
-    raw_story,
-    age_group,
-):
-
-    """
-    Convert the model output into a clean, complete story.
-
-    We intentionally preserve the complete generated text
-    instead of arbitrarily taking only the first paragraph.
-    """
-
-    story = clean_story_text(
-        raw_story
+    result = tokenizer.decode(
+        generated_tokens,
+        skip_special_tokens=True,
     )
 
-    sentences = split_sentences(
-        story
-    )
-
-    sentences = remove_repeated_sentences(
-        sentences
-    )
-
-    # --------------------------------------------------------
-    # Age-specific sentence limits.
-    #
-    # These are limits, not truncation rules.
-    #
-    # We only apply them if the model generated MORE than
-    # requested. We never cut a sentence in half.
-    # --------------------------------------------------------
-
-    if age_group == "3–5":
-
-        maximum_sentences = 5
-
-    elif age_group == "6–7":
-
-        maximum_sentences = 7
-
-    else:
-
-        maximum_sentences = 10
-
-    # Keep complete sentences only.
-
-    if len(sentences) > maximum_sentences:
-
-        sentences = sentences[
-            :maximum_sentences
-        ]
-
-    story = " ".join(
-        sentences
-    ).strip()
-
-    # --------------------------------------------------------
-    # Remove a repeated ending.
-    #
-    # Example:
-    #
-    # They went home happily.
-    # They went home happily.
-    #
-    # This catches some cases where punctuation differs.
-    # --------------------------------------------------------
-
-    if len(sentences) >= 2:
-
-        last = re.sub(
-            r"[^a-z0-9\s]",
-            "",
-            sentences[-1].lower(),
-        )
-
-        second_last = re.sub(
-            r"[^a-z0-9\s]",
-            "",
-            sentences[-2].lower(),
-        )
-
-        if last == second_last:
-
-            sentences = sentences[:-1]
-
-            story = " ".join(
-                sentences
-            ).strip()
-
-    return story
+    return clean_sentence(result)
 
 
 # ============================================================
@@ -531,352 +459,345 @@ def generate_story(
     story_style,
 ):
 
-    tokenizer = None
-    model = None
+    tokenizer, model = load_text_model()
 
-    try:
+    # --------------------------------------------------------
+    # Number of sentences
+    # --------------------------------------------------------
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            TEXT_MODEL
+    if age_group == "3–5":
+
+        sentence_count = 4
+
+    elif age_group == "6–7":
+
+        sentence_count = 6
+
+    else:
+
+        sentence_count = 8
+
+    # --------------------------------------------------------
+    # Style
+    # --------------------------------------------------------
+
+    styles = {
+
+        "🐉 Magical":
+            "gentle magical adventure",
+
+        "🚀 Adventure":
+            "fun and safe adventure",
+
+        "🐾 Animal":
+            "friendly animal adventure",
+
+        "😂 Funny":
+            "funny and silly adventure",
+    }
+
+    style = styles.get(
+        story_style,
+        "warm children's adventure",
+    )
+
+    # --------------------------------------------------------
+    # Story structure
+    # --------------------------------------------------------
+
+    if sentence_count == 4:
+
+        roles = [
+            "Introduce the main character and setting.",
+            "Introduce a small fun surprise or problem.",
+            "Show the character solving the problem.",
+            "End with a happy and reassuring ending.",
+        ]
+
+    elif sentence_count == 6:
+
+        roles = [
+            "Introduce the main character and setting.",
+            "Introduce an interesting discovery.",
+            "Describe a small problem or challenge.",
+            "Show the character trying to solve it.",
+            "Show the character succeeding.",
+            "End with a happy and reassuring ending.",
+        ]
+
+    else:
+
+        roles = [
+            "Introduce the main character and setting.",
+            "Introduce an interesting discovery or mystery.",
+            "Describe something surprising that happens.",
+            "Show the character beginning a gentle adventure.",
+            "Add a small safe challenge.",
+            "Show the character finding a clever solution.",
+            "Show what happens after the problem is solved.",
+            "End with a warm, happy and reassuring ending.",
+        ]
+
+    story_sentences = []
+
+    progress = st.progress(
+        0,
+        text="Creating the story..."
+    )
+
+    for index in range(
+        sentence_count
+    ):
+
+        role = roles[index]
+
+        previous_story = " ".join(
+            story_sentences
         )
 
-        model = AutoModelForCausalLM.from_pretrained(
-            TEXT_MODEL
-        )
-
-        model.to(DEVICE)
-        model.eval()
-
         # ----------------------------------------------------
-        # Age-specific instructions
+        # Build context.
         # ----------------------------------------------------
 
-        if age_group == "3–5":
+        if previous_story:
 
-            length_instruction = (
-                "Write exactly 4 short sentences."
+            context = (
+                "Story written so far:\n"
+                f"{previous_story}\n\n"
             )
-
-            max_tokens = 100
-
-        elif age_group == "6–7":
-
-            length_instruction = (
-                "Write exactly 6 short sentences."
-            )
-
-            max_tokens = 140
 
         else:
 
-            length_instruction = (
-                "Write exactly 8 complete sentences. "
-                "Each sentence should be short enough "
-                "for a child to understand."
-            )
-
-            max_tokens = 180
+            context = ""
 
         # ----------------------------------------------------
-        # Styles
+        # Ending instruction
         # ----------------------------------------------------
 
-        styles = {
+        if index == sentence_count - 1:
 
-            "🐉 Magical":
-                "Make it a gentle magical adventure.",
+            ending_instruction = """
+This is the FINAL sentence.
+Finish the story completely.
+Give it a happy, warm and reassuring ending.
+Do not introduce a new problem.
+Do not leave the story unfinished.
+"""
 
-            "🚀 Adventure":
-                "Make it a fun and safe adventure.",
+        else:
 
-            "🐾 Animal":
-                "Make friendly animals important characters.",
-
-            "😂 Funny":
-                "Include something silly and funny.",
-        }
-
-        style_instruction = styles.get(
-            story_style,
-            "Make it a warm children's story.",
-        )
+            ending_instruction = """
+This is NOT the final sentence.
+Continue the story naturally.
+Do not end the story yet.
+"""
 
         # ----------------------------------------------------
         # Prompt
         # ----------------------------------------------------
 
         prompt = f"""
-You are a children's story writer.
+You are writing a story for a child aged {age_group}.
 
-Create one complete story based on this picture:
-
+The picture shows:
 {description}
 
-The reader is {age_group} years old.
+The story style is:
+{style}
 
-{length_instruction}
+{context}
 
-{style_instruction}
+Write exactly ONE new sentence.
 
-IMPORTANT:
+The purpose of this sentence is:
+{role}
 
-- Finish the story.
-- Do not stop in the middle.
-- Do not repeat any sentence.
-- Do not repeat the same event several times.
+Rules:
+
+- Write only one sentence.
+- Do not repeat an earlier sentence.
+- Do not repeat the same event.
+- Use simple language.
+- Keep the story imaginative and positive.
+- Keep it safe for children.
+- No violence.
+- No weapons.
+- No frightening scenes.
+- No adult topics.
+- No dangerous instructions.
+- Do not mention AI.
 - Do not write a title.
 - Do not write "Story:".
 - Do not use bullet points.
-- Do not use numbered lists.
-- Write exactly the requested number of complete sentences.
-- Every sentence must end naturally with punctuation.
-- Use simple vocabulary.
-- Make the story warm, playful and imaginative.
-- Keep it safe for children.
-- Do not include violence.
-- Do not include weapons.
-- Do not include frightening scenes.
-- Do not include adult topics.
-- Do not include dangerous instructions.
-- End with a happy or reassuring ending.
-- Output ONLY the story.
+- Do not use quotation marks around the sentence.
 
+{ending_instruction}
+
+New sentence:
 """
 
-        messages = [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ]
-
         # ----------------------------------------------------
-        # Chat template
+        # Try up to 3 times if duplicate/empty.
         # ----------------------------------------------------
 
-        input_text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        sentence = ""
 
-        inputs = tokenizer(
-            input_text,
-            return_tensors="pt",
-        )
+        for attempt in range(3):
 
-        inputs = {
-            key: value.to(DEVICE)
-            for key, value in inputs.items()
-        }
-
-        # ----------------------------------------------------
-        # Generate
-        # ----------------------------------------------------
-
-        with torch.no_grad():
-
-            output = model.generate(
-                **inputs,
-
-                max_new_tokens=max_tokens,
-
-                min_new_tokens=50,
-
-                do_sample=True,
-
-                temperature=0.65,
-
-                top_p=0.88,
-
-                repetition_penalty=1.15,
-
-                no_repeat_ngram_size=4,
-
-                eos_token_id=tokenizer.eos_token_id,
-
-                pad_token_id=(
-                    tokenizer.pad_token_id
-                    if tokenizer.pad_token_id is not None
-                    else tokenizer.eos_token_id
-                ),
-            )
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Decode ONLY newly generated tokens.
-        # ----------------------------------------------------
-
-        generated_tokens = output[
-            0,
-            inputs["input_ids"].shape[1]:
-        ]
-
-        raw_story = tokenizer.decode(
-            generated_tokens,
-            skip_special_tokens=True,
-        )
-
-        # ----------------------------------------------------
-        # Clean and validate
-        # ----------------------------------------------------
-
-        story = finalize_story(
-            raw_story,
-            age_group,
-        )
-
-        # ----------------------------------------------------
-        # If the model stopped too early, make one retry.
-        # ----------------------------------------------------
-
-        sentence_count = len(
-            split_sentences(story)
-        )
-
-        if (
-            age_group == "8–10"
-            and sentence_count < 6
-        ):
-
-            # A small model can occasionally stop early.
-            # Retry with a stronger instruction.
-
-            retry_prompt = f"""
-Write a complete children's story about:
-
-{description}
-
-The child is 8 to 10 years old.
-
-Write exactly 8 complete sentences.
-
-Style:
-{style_instruction}
-
-IMPORTANT:
-Finish the entire story.
-Do not stop early.
-Do not repeat sentences.
-Do not repeat events.
-Use simple language.
-End with a happy ending.
-
-Output only the 8 story sentences.
-"""
-
-            retry_messages = [
-                {
-                    "role": "user",
-                    "content": retry_prompt,
-                }
-            ]
-
-            retry_input = (
-                tokenizer.apply_chat_template(
-                    retry_messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            )
-
-            retry_inputs = tokenizer(
-                retry_input,
-                return_tensors="pt",
-            )
-
-            retry_inputs = {
-                key: value.to(DEVICE)
-                for key, value in retry_inputs.items()
-            }
-
-            with torch.no_grad():
-
-                retry_output = model.generate(
-                    **retry_inputs,
-
-                    max_new_tokens=180,
-
-                    min_new_tokens=70,
-
-                    do_sample=True,
-
-                    temperature=0.60,
-
-                    top_p=0.88,
-
-                    repetition_penalty=1.18,
-
-                    no_repeat_ngram_size=4,
-
-                    eos_token_id=tokenizer.eos_token_id,
-
-                    pad_token_id=(
-                        tokenizer.pad_token_id
-                        if tokenizer.pad_token_id is not None
-                        else tokenizer.eos_token_id
-                    ),
-                )
-
-            retry_tokens = retry_output[
-                0,
-                retry_inputs["input_ids"].shape[1]:
-            ]
-
-            retry_story = tokenizer.decode(
-                retry_tokens,
-                skip_special_tokens=True,
-            )
-
-            retry_story = finalize_story(
-                retry_story,
-                age_group,
-            )
-
-            retry_sentence_count = len(
-                split_sentences(
-                    retry_story
-                )
+            candidate = generate_one_sentence(
+                tokenizer,
+                model,
+                prompt,
+                max_new_tokens=50,
             )
 
             if (
-                retry_sentence_count
-                > sentence_count
+                candidate
+                and not is_duplicate_sentence(
+                    candidate,
+                    story_sentences,
+                )
             ):
 
-                story = retry_story
+                sentence = candidate
+                break
 
-            del retry_output
-            del retry_inputs
+            # Make retry more explicit.
 
-        # ----------------------------------------------------
-        # Final validation
-        # ----------------------------------------------------
+            prompt += f"""
 
-        story = finalize_story(
-            story,
-            age_group,
+IMPORTANT RETRY:
+The previous attempt was not acceptable.
+Write a completely different sentence.
+Do not repeat these sentences:
+
+{" ".join(story_sentences)}
+"""
+
+        if not sentence:
+
+            # ------------------------------------------------
+            # Safe fallback.
+            #
+            # We would rather have a complete short story
+            # than silently display an incomplete one.
+            # ------------------------------------------------
+
+            fallback_sentences = [
+                "The adventure continued with a bright smile.",
+                "Everyone discovered something wonderful together.",
+                "They laughed and shared the happy moment.",
+                "At last, they returned home feeling proud and happy.",
+            ]
+
+            for fallback in fallback_sentences:
+
+                if not is_duplicate_sentence(
+                    fallback,
+                    story_sentences,
+                ):
+
+                    sentence = fallback
+                    break
+
+        story_sentences.append(
+            sentence
         )
 
-        if not story:
+        progress.progress(
+            (index + 1) / sentence_count,
+            text=(
+                f"Writing sentence "
+                f"{index + 1} of "
+                f"{sentence_count}..."
+            ),
+        )
 
-            raise RuntimeError(
-                "The story generator returned an empty story."
+    progress.empty()
+
+    # --------------------------------------------------------
+    # Final story
+    # --------------------------------------------------------
+
+    story = " ".join(
+        story_sentences
+    ).strip()
+
+    # --------------------------------------------------------
+    # Final duplicate protection
+    # --------------------------------------------------------
+
+    cleaned_sentences = []
+
+    for sentence in story_sentences:
+
+        if not is_duplicate_sentence(
+            sentence,
+            cleaned_sentences,
+        ):
+
+            cleaned_sentences.append(
+                sentence
             )
 
-        return story
+    story = " ".join(
+        cleaned_sentences
+    ).strip()
 
-    finally:
+    # --------------------------------------------------------
+    # Ensure complete ending.
+    # --------------------------------------------------------
 
-        del model
-        del tokenizer
+    if cleaned_sentences:
 
-        cleanup_memory()
+        last_sentence = cleaned_sentences[-1]
+
+        ending_words = (
+            "happy",
+            "smile",
+            "home",
+            "wonderful",
+            "joy",
+            "proud",
+            "together",
+        )
+
+        # If the final generated sentence doesn't appear
+        # to contain an ending, append a gentle ending.
+        #
+        # This is intentionally conservative.
+        if not any(
+            word in last_sentence.lower()
+            for word in ending_words
+        ):
+
+            if age_group == "8–10":
+
+                cleaned_sentences[-1] = (
+                    last_sentence.rstrip(".!?")
+                    + ". At the end of the adventure, "
+                    "everyone went home with happy hearts."
+                )
+
+            else:
+
+                cleaned_sentences[-1] = (
+                    last_sentence.rstrip(".!?")
+                    + ". Everyone ended the day "
+                    "with a big happy smile."
+                )
+
+    story = " ".join(
+        cleaned_sentences
+    ).strip()
+
+    cleanup_memory()
+
+    return story
 
 
 # ============================================================
-# TTS CHUNKING
+# TTS
 # ============================================================
 
 def split_text_for_tts(
@@ -885,15 +806,15 @@ def split_text_for_tts(
 ):
 
     """
-    Split the story into VERY short pieces.
+    One short sentence per TTS chunk.
 
-    SpeechT5 is much more reliable with short inputs.
-
-    We intentionally use ~90 characters rather than 150.
+    Keeping chunks short dramatically reduces SpeechT5
+    repetition problems.
     """
 
-    sentences = split_sentences(
-        text
+    sentences = re.split(
+        r"(?<=[.!?])\s+",
+        text.strip(),
     )
 
     chunks = []
@@ -903,12 +824,7 @@ def split_text_for_tts(
         sentence = sentence.strip()
 
         if not sentence:
-
             continue
-
-        # ----------------------------------------------------
-        # A normal short sentence can be one TTS chunk.
-        # ----------------------------------------------------
 
         if len(sentence) <= max_chars:
 
@@ -916,9 +832,7 @@ def split_text_for_tts(
 
             continue
 
-        # ----------------------------------------------------
         # Long sentence → split by words.
-        # ----------------------------------------------------
 
         words = sentence.split()
 
@@ -937,55 +851,38 @@ def split_text_for_tts(
             else:
 
                 if current:
-
-                    chunks.append(
-                        current
-                    )
+                    chunks.append(current)
 
                 current = word
 
         if current:
-
-            chunks.append(
-                current
-            )
+            chunks.append(current)
 
     return chunks
 
 
 # ============================================================
-# REMOVE AUDIO CHUNK OVERLAP
+# AUDIO
 # ============================================================
 
-def add_audio_silence(
+def add_silence(
     audio,
-    milliseconds=80,
+    milliseconds=100,
 ):
 
-    """
-    Add a tiny pause between sentences.
-
-    This makes the final audio sound natural and also
-    prevents the end of one SpeechT5 generation from
-    sounding like it runs into the next one.
-    """
-
-    silence_length = int(
+    length = int(
         SAMPLE_RATE
         * milliseconds
         / 1000
     )
 
     silence = np.zeros(
-        silence_length,
+        length,
         dtype=np.float32,
     )
 
     return np.concatenate(
-        [
-            audio,
-            silence,
-        ]
+        [audio, silence]
     )
 
 
@@ -1009,14 +906,6 @@ def text_to_speech(text):
                 "There is no story to read."
             )
 
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Use the FINAL story shown on screen.
-        #
-        # We don't regenerate or reconstruct the story here.
-        # ----------------------------------------------------
-
         chunks = split_text_for_tts(
             text,
             max_chars=90,
@@ -1025,37 +914,31 @@ def text_to_speech(text):
         if not chunks:
 
             raise ValueError(
-                "The story contains no readable text."
+                "No readable sentences found."
             )
 
         st.info(
-            f"🔊 Reading "
-            f"{len(chunks)} short sentences..."
+            f"🔊 Reading {len(chunks)} "
+            "short parts..."
         )
 
         # ----------------------------------------------------
         # Speaker
         # ----------------------------------------------------
 
-        speaker_embedding = (
-            load_speaker_embedding()
-        )
+        speaker = load_speaker_embedding()
 
-        speaker_embedding = (
-            speaker_embedding.to(DEVICE)
+        speaker = speaker.to(
+            DEVICE
         )
 
         # ----------------------------------------------------
-        # Processor
+        # Models
         # ----------------------------------------------------
 
         processor = SpeechT5Processor.from_pretrained(
             TTS_MODEL
         )
-
-        # ----------------------------------------------------
-        # TTS model
-        # ----------------------------------------------------
 
         model = SpeechT5ForTextToSpeech.from_pretrained(
             TTS_MODEL
@@ -1064,10 +947,6 @@ def text_to_speech(text):
         model.to(DEVICE)
         model.eval()
 
-        # ----------------------------------------------------
-        # Vocoder
-        # ----------------------------------------------------
-
         vocoder = SpeechT5HifiGan.from_pretrained(
             TTS_VOCODER
         )
@@ -1075,15 +954,11 @@ def text_to_speech(text):
         vocoder.to(DEVICE)
         vocoder.eval()
 
-        # ----------------------------------------------------
-        # Audio
-        # ----------------------------------------------------
-
-        audio_chunks = []
+        audio_parts = []
 
         progress = st.progress(
             0,
-            text="Preparing the storyteller..."
+            text="Preparing audio..."
         )
 
         for index, chunk in enumerate(
@@ -1093,7 +968,7 @@ def text_to_speech(text):
             progress.progress(
                 (index + 1) / len(chunks),
                 text=(
-                    f"🔊 Reading sentence "
+                    f"🔊 Reading part "
                     f"{index + 1} of "
                     f"{len(chunks)}..."
                 ),
@@ -1112,45 +987,28 @@ def text_to_speech(text):
                 "input_ids"
             ].to(DEVICE)
 
-            token_count = (
-                input_ids.shape[1]
-            )
-
             # ------------------------------------------------
-            # Extra safety.
-            #
-            # We are intentionally well below 600.
+            # Safety limit
             # ------------------------------------------------
 
-            if token_count >= 300:
+            if input_ids.shape[1] >= 300:
 
                 raise ValueError(
-                    "A sentence is unexpectedly long "
-                    f"({token_count} tokens). "
-                    "Please try a shorter story."
+                    "One sentence is too long "
+                    "for reliable speech generation."
                 )
 
             # ------------------------------------------------
-            # Generate speech.
-            #
-            # maxlenratio limits how long SpeechT5 can
-            # continue generating audio.
-            #
-            # This is important for preventing a generated
-            # sentence from repeating its ending.
+            # Generate
             # ------------------------------------------------
 
             with torch.no_grad():
 
                 speech = model.generate_speech(
                     input_ids,
-                    speaker_embedding,
+                    speaker,
                     vocoder=vocoder,
-
-                    # Prevent excessively long output.
-                    maxlenratio=10.0,
-
-                    # Avoid extremely short output.
+                    maxlenratio=8.0,
                     minlenratio=1.0,
                 )
 
@@ -1162,27 +1020,22 @@ def text_to_speech(text):
                 .astype(np.float32)
             )
 
-            # ------------------------------------------------
-            # Safety check
-            # ------------------------------------------------
-
             if speech.size == 0:
 
                 raise RuntimeError(
-                    f"SpeechT5 returned empty audio "
-                    f"for sentence {index + 1}."
+                    "SpeechT5 generated empty audio."
                 )
 
             # ------------------------------------------------
-            # Add a small pause.
+            # Pause between sentences.
             # ------------------------------------------------
 
-            speech = add_audio_silence(
+            speech = add_silence(
                 speech,
-                milliseconds=80,
+                milliseconds=120,
             )
 
-            audio_chunks.append(
+            audio_parts.append(
                 speech
             )
 
@@ -1195,40 +1048,34 @@ def text_to_speech(text):
         progress.empty()
 
         # ----------------------------------------------------
-        # Combine audio
+        # Combine
         # ----------------------------------------------------
 
-        if not audio_chunks:
-
-            raise RuntimeError(
-                "No audio was generated."
-            )
-
-        combined_audio = np.concatenate(
-            audio_chunks
+        combined = np.concatenate(
+            audio_parts
         )
 
         # ----------------------------------------------------
         # WAV
         # ----------------------------------------------------
 
-        audio_buffer = io.BytesIO()
+        buffer = io.BytesIO()
 
         sf.write(
-            audio_buffer,
-            combined_audio,
+            buffer,
+            combined,
             SAMPLE_RATE,
             format="WAV",
         )
 
-        audio_buffer.seek(0)
+        buffer.seek(0)
 
-        audio_bytes = audio_buffer.read()
+        audio_bytes = buffer.read()
 
         if not audio_bytes:
 
             raise RuntimeError(
-                "The generated WAV file is empty."
+                "Generated audio is empty."
             )
 
         return audio_bytes
@@ -1329,7 +1176,7 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Image
+    # Upload
     # --------------------------------------------------------
 
     st.subheader(
@@ -1370,7 +1217,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # Open image
+    # Image
     # --------------------------------------------------------
 
     try:
@@ -1382,8 +1229,7 @@ def main():
     except Exception:
 
         st.error(
-            "I couldn't open that picture. "
-            "Please try another image."
+            "I couldn't open that picture."
         )
 
         return
@@ -1395,7 +1241,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Generate story
+    # Generate
     # --------------------------------------------------------
 
     if st.button(
@@ -1407,7 +1253,7 @@ def main():
         reset_story()
 
         # ----------------------------------------------------
-        # Image → description
+        # Vision
         # ----------------------------------------------------
 
         with st.spinner(
@@ -1423,18 +1269,21 @@ def main():
         ] = description
 
         # ----------------------------------------------------
-        # Description → story
+        # Story
         # ----------------------------------------------------
 
-        with st.spinner(
-            "🪄 Creating your story..."
-        ):
+        story = generate_story(
+            description,
+            age_group,
+            story_style,
+        )
 
-            story = generate_story(
-                description,
-                age_group,
-                story_style,
-            )
+        # ----------------------------------------------------
+        # IMPORTANT:
+        #
+        # Store the exact final story that is displayed.
+        # TTS later reads this exact string.
+        # ----------------------------------------------------
 
         st.session_state[
             "story"
@@ -1505,7 +1354,7 @@ def main():
                     ]
                 )
 
-            if audio is not None:
+            if audio:
 
                 st.session_state[
                     "audio"
@@ -1516,7 +1365,7 @@ def main():
                 )
 
         # ----------------------------------------------------
-        # Player
+        # Audio player
         # ----------------------------------------------------
 
         if st.session_state.get(
@@ -1531,7 +1380,7 @@ def main():
             )
 
             st.download_button(
-                label="⬇️ Download audio",
+                "⬇️ Download audio",
                 data=st.session_state[
                     "audio"
                 ],
@@ -1540,11 +1389,11 @@ def main():
                 use_container_width=True,
             )
 
+        st.write("")
+
         # ----------------------------------------------------
         # New story
         # ----------------------------------------------------
-
-        st.write("")
 
         if st.button(
             "🌟 Make Another Story",
@@ -1557,7 +1406,7 @@ def main():
 
 
 # ============================================================
-# ENTRY POINT
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
