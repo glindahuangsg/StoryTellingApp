@@ -78,20 +78,13 @@ def load_vision_model():
 # ============================================================
 
 @st.cache_resource
-def load_text_model():
+def load_vision_model():
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        TEXT_MODEL
+    return pipeline(
+        "image-text-to-text",
+        model=VISION_MODEL,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        TEXT_MODEL,
-        torch_dtype=DTYPE,
-    )
-
-    model.to(DEVICE)
-
-    return tokenizer, model
 
 
 # ============================================================
@@ -113,7 +106,7 @@ def load_tts_model():
 # IMAGE → DESCRIPTION
 # ============================================================
 
-def image_to_text(image, processor, model):
+def image_to_text(image, model):
 
     messages = [
         {
@@ -129,45 +122,22 @@ def image_to_text(image, processor, model):
                         "Use simple, friendly words. "
                         "Mention the main people, animals, "
                         "objects, colors, and actions you can see. "
-                        "Do not guess private information about people."
+                        "Do not guess names, ages, locations, "
+                        "or other private information."
                     ),
                 },
             ],
         }
     ]
 
-    prompt = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
+    result = model(
+        text=messages,
+        max_new_tokens=80,
+        return_full_text=False,
     )
 
-    inputs = processor(
-        text=prompt,
-        images=[image],
-        return_tensors="pt",
-    )
+    return result[0]["generated_text"]
 
-    inputs = {
-        key: value.to(DEVICE)
-        if hasattr(value, "to")
-        else value
-        for key, value in inputs.items()
-    }
-
-    with torch.no_grad():
-
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=80,
-            do_sample=False,
-        )
-
-    result = processor.batch_decode(
-        generated_ids,
-        skip_special_tokens=True,
-    )[0]
-
-    return result.strip()
 
 
 # ============================================================
