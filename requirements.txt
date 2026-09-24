@@ -1,56 +1,9 @@
-# =====================================================================================
-# requirements.txt — Python dependencies for "Story Time!"
-#
-# IMPORTANT: the --extra-index-url line below makes pip fetch the CPU-only build of
-# PyTorch (~200MB) instead of the default PyPI wheel (which bundles CUDA support and
-# is 800MB-2GB+). The full wheel routinely times out or runs out of memory during a
-# Streamlit Community Cloud build.
-#
-# torch is pinned to 2.9.1+cpu because that is the oldest CPU-only build confirmed
-# available for Streamlit Cloud's current Python runtime. Note: pip does not allow a
-# wildcard version ("2.9.*") together with a "+cpu" local version label, so this must
-# be an exact "==" pin, not a range.
-#
-# GENERAL NOTE: Streamlit Community Cloud's provisioned Python version has moved
-# twice already while building this app (3.11 -> 3.13 -> 3.14), and each jump broke
-# a different exact pin here (first torch, then Pillow, below) because older package
-# versions don't ship prebuilt wheels for a brand-new Python version, forcing pip to
-# compile from source, which then fails on missing system build headers. That's why
-# every package except torch is left as a loose ">=,<" range: pip can then pick
-# whatever version actually has a matching wheel for the runtime it's given. If a
-# future deploy fails with "Could not find a version that satisfies the requirement
-# torch==2.9.1+cpu" or a "Failed to download and build <package>" source-build error,
-# check the build log for the Python version in use (e.g. "cp314" = Python 3.14) and
-# either bump the torch pin to a version confirmed available for it, or loosen the
-# failing package's range the same way Pillow was loosened below.
-# =====================================================================================
---extra-index-url https://download.pytorch.org/whl/cpu
-
-# --- Web app framework -------------------------------------------------------------
-streamlit>=1.38,<2
-
-# --- Hugging Face model pipelines (captioning + story generation + text-to-speech) -
-transformers>=4.44,<5
-torch==2.9.1+cpu
-sentencepiece>=0.2.0      # required tokenizer backend for the flan-t5 model
-accelerate>=0.34          # speeds up / simplifies model loading on CPU
-
-# --- Image handling ------------------------------------------------------------------
-# Loosened from the original "<11" cap: Pillow 10.4.0 has no prebuilt wheel for
-# Python 3.14, so pip tried to compile it from source and failed on a missing zlib
-# header. 11.x+ ships prebuilt wheels for current Python versions.
-Pillow>=11,<13
-
-# --- Audio handling -------------------------------------------------------------------
-# The Hugging Face text-to-speech pipeline (facebook/mms-tts-eng) returns raw audio
-# samples as a numpy array, not an audio file — soundfile encodes those samples into
-# a WAV file in memory so Streamlit can play/download it.
-#
-# NOTE: the `datasets` package was briefly added here to load a specific voice's
-# speaker embedding for microsoft/speecht5_tts, but was removed again — `datasets`
-# pulls in `dill` for cache fingerprinting, and that version of `dill` is incompatible
-# with a pickle-internals change in Python 3.14 (Streamlit Cloud's runtime), crashing
-# with "TypeError: Pickler._batch_setitems() takes 2 positional arguments but 3 were
-# given" on every run. facebook/mms-tts-eng needs no such dependency.
-numpy>=1.24,<3
-soundfile>=0.12,<1
+streamlit
+torch
+transformers
+accelerate
+pillow
+numpy
+soundfile
+datasets
+sentencepiece
