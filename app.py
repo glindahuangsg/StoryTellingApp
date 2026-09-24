@@ -1,5 +1,3 @@
-pip install --upgrade pip
-
 """
 =====================================================================================
  app.py — "Story Time!" — An AI Storytelling App for Kids (ages 3-10)
