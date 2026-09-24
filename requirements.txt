@@ -7,13 +7,22 @@
 # Streamlit Community Cloud build.
 #
 # torch is pinned to 2.9.1+cpu because that is the oldest CPU-only build confirmed
-# available for Streamlit Cloud's current Python runtime (Python 3.13, which has no
-# PyTorch build before 2.9.0). Note: pip does not allow a wildcard version ("2.9.*")
-# together with a "+cpu" local version label, so this must be an exact "==" pin, not
-# a range. If Streamlit Cloud's Python version changes again and the build fails with
-# "Could not find a version that satisfies the requirement torch==2.9.1+cpu", open the
-# build log's ERROR line (it lists the versions actually available) and update the
-# line below to one of those, keeping the exact "==<version>+cpu" format.
+# available for Streamlit Cloud's current Python runtime. Note: pip does not allow a
+# wildcard version ("2.9.*") together with a "+cpu" local version label, so this must
+# be an exact "==" pin, not a range.
+#
+# GENERAL NOTE: Streamlit Community Cloud's provisioned Python version has moved
+# twice already while building this app (3.11 -> 3.13 -> 3.14), and each jump broke
+# a different exact pin here (first torch, then Pillow, below) because older package
+# versions don't ship prebuilt wheels for a brand-new Python version, forcing pip to
+# compile from source, which then fails on missing system build headers. That's why
+# every package except torch is left as a loose ">=,<" range: pip can then pick
+# whatever version actually has a matching wheel for the runtime it's given. If a
+# future deploy fails with "Could not find a version that satisfies the requirement
+# torch==2.9.1+cpu" or a "Failed to download and build <package>" source-build error,
+# check the build log for the Python version in use (e.g. "cp314" = Python 3.14) and
+# either bump the torch pin to a version confirmed available for it, or loosen the
+# failing package's range the same way Pillow was loosened below.
 # =====================================================================================
 --extra-index-url https://download.pytorch.org/whl/cpu
 
@@ -27,7 +36,10 @@ sentencepiece>=0.2.0      # required tokenizer backend for the flan-t5 model
 accelerate>=0.34          # speeds up / simplifies model loading on CPU
 
 # --- Image handling ------------------------------------------------------------------
-Pillow>=10.4,<11
+# Loosened from the original "<11" cap: Pillow 10.4.0 has no prebuilt wheel for
+# Python 3.14, so pip tried to compile it from source and failed on a missing zlib
+# header. 11.x+ ships prebuilt wheels for current Python versions.
+Pillow>=11,<13
 
 # --- Audio handling -------------------------------------------------------------------
 # The Hugging Face text-to-speech pipeline (facebook/mms-tts-eng) returns raw audio
@@ -35,9 +47,3 @@ Pillow>=10.4,<11
 # a WAV file in memory so Streamlit can play/download it.
 numpy>=1.24,<3
 soundfile>=0.12,<1
-
-
-streamlit
-transformers<5.0.0
-Pillow
-torch
