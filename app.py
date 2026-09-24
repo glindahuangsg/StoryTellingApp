@@ -1,121 +1,84 @@
-"""
-Story Time - Simple AI Storytelling App
-----------------------------------------
-Turns a photo into a short story you can listen to.
-
-How it works:
-  1. Upload a picture.
-  2. An AI model looks at the picture and writes a short caption.
-  3. Another AI model turns that caption into a short story.
-  4. A third AI model reads the story out loud.
-"""
-
-import io
-
-import numpy as np
-import soundfile as sf
 import streamlit as st
-from PIL import Image
+from dotenv import find_dotenv, load_dotenv
 from transformers import pipeline
+import requests
+import os
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from IPython.display import Audio
+from PIL import Image
+from io import BytesIO
+
+st.title("Image to Audio Text Generation")
+
+load_dotenv(find_dotenv())
+HUGGINGFACEHUB_API_TOKENS = os.getenv("api_token")
+
+def img2text(image):
+    image_to_text = pipeline("image-to-text", model="Salesforce/blip-image-captioning-base")
+    text = image_to_text(image)[0]['generated_text']
+    st.text("Generated Story from Image:")
+    st.write(text)
+
+    st.image(image, use_column_width=True)
+    return text
+
+st.text("You can choose any one of the following:")
+image_url = st.text_input("1. Enter the URL of the image:")
+st.write("or")
+image_file = st.file_uploader("2. Upload an image", type=["jpg", "jpeg", "png"])
+
+if image_url and st.button("Generate Text from Image (URL)"):
+    try:
+        image = Image.open(requests.get(image_url, stream=True).raw)
+        image_caption = img2text(image)
+    except Exception as e:
+        st.error("Error: Invalid URL or unsupported image format.")
+
+if image_file and st.button("Generate Text from Image (Upload)"):
+    image = Image.open(image_file)
+    image_caption = img2text(image)
+
+if "image_caption" in locals():
+    API_URL = "https://api-inference.huggingface.co/models/HuggingFaceH4/zephyr-7b-beta"
+    headers = {"Authorization": f"Bearer {HUGGINGFACEHUB_API_TOKENS}"}
+    # text_generative =pipeline("text-generation", model="HuggingFaceH4/zephyr-7b-beta")
 
 
-# ---- Load the three AI models -----------------------------------------------
-# @st.cache_resource means each model is only actually loaded ONE time, then
-# reused, instead of being re-downloaded every time a button is clicked.
 
-@st.cache_resource
-def load_caption_model():
-    return pipeline("image-to-text", model="Salesforce/blip-image-captioning-base")
+    def query(prompt, max_new_tokens=200):
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": max_new_tokens
+            }
+        }
+        response = requests.post(API_URL, headers=headers, json=payload)
+        return response.json()
 
+    data = query(image_caption, max_new_tokens=250)
+    if data and isinstance(data, list) and data[0] and isinstance(data[0], dict):
+        generated_text = data[0].get("generated_text", "")
+    else:
+        generated_text = ""
 
-@st.cache_resource
-def load_story_model():
-    return pipeline("text2text-generation", model="google/flan-t5-small")
+    st.text("Generated Text:")
+    st.write(generated_text)
 
+    API_URL = "https://api-inference.huggingface.co/models/espnet/kan-bayashi_ljspeech_vits"
+    headers = {"Authorization": f"Bearer {HUGGINGFACEHUB_API_TOKENS}"}
 
-@st.cache_resource
-def load_audio_model():
-    return pipeline("text-to-speech", model="facebook/mms-tts-eng")
+    def generate_and_play_audio(text, sampling_rate=22050):
+        payload = {"inputs": text}
+        response = requests.post(API_URL, headers=headers, json=payload)
+        audio = response.content
 
+        # Create an Audio object to play the binary audio data
+        return Audio(audio, rate=sampling_rate)
 
-# ---- The three steps of the pipeline ----------------------------------------
+    if "generated_text" in locals():
+        text_to_speak = generated_text
+        audio_object = generate_and_play_audio(text_to_speak)
+        st.write("Audio Response:")
+        st.audio(audio_object.data, format="audio/wav")
 
-def image_to_caption(image):
-    """Look at the image and describe it in words."""
-    caption_model = load_caption_model()
-    result = caption_model(image)
-    return result[0]["generated_text"]
-
-
-def caption_to_story(caption):
-    """Turn the caption into a short children's story."""
-    story_model = load_story_model()
-    prompt = (
-        "Write a short, gentle story for young children based on this scene: "
-        f"'{caption}'. The story should be about 50 to 100 words long."
-    )
-    result = story_model(
-        prompt,
-        max_new_tokens=180,
-        min_new_tokens=60,
-        # These two settings stop the model from getting "stuck" and looping
-        # the same phrase over and over when pushed past what it would
-        # naturally write (which is what min_new_tokens above does).
-        no_repeat_ngram_size=3,   # never repeat the same 3-word phrase twice
-        repetition_penalty=1.3,   # discourage reusing recent words in general
-    )
-    return result[0]["generated_text"]
-
-
-def story_to_audio(story):
-    """Turn the story text into playable audio (WAV bytes)."""
-    audio_model = load_audio_model()
-    result = audio_model(story)
-
-    # The model gives back numbers representing sound, plus a sample rate.
-    # np.squeeze removes an extra "wrapper" layer around those numbers.
-    audio_array = np.squeeze(result["audio"])
-    sample_rate = result["sampling_rate"]
-
-    # Write those numbers into a real WAV file, kept in memory (not on disk).
-    audio_buffer = io.BytesIO()
-    sf.write(audio_buffer, audio_array, sample_rate, format="WAV")
-    return audio_buffer.getvalue()
-
-
-# ---- The app itself ----------------------------------------------------------
-
-def main():
-    """Draw the page and run the pipeline when the user clicks the button."""
-    st.set_page_config(page_title="Story Time", page_icon="📖")
-    st.title("📖 Story Time")
-    st.write("Upload a picture and turn it into a story you can listen to!")
-
-    uploaded_file = st.file_uploader("Upload a picture", type=["png", "jpg", "jpeg"])
-
-    if uploaded_file is not None:
-        image = Image.open(uploaded_file).convert("RGB")
-        st.image(image, caption="Your picture", width=300)
-
-        if st.button("Make My Story!"):
-            with st.spinner("Looking at your picture..."):
-                caption = image_to_caption(image)
-            st.write("**Caption:**", caption)
-
-            with st.spinner("Writing your story..."):
-                story = caption_to_story(caption)
-            st.write("**Story:**")
-            st.write(story)
-
-            with st.spinner("Recording the story..."):
-                audio_bytes = story_to_audio(story)
-            st.write("**Listen:**")
-            st.audio(audio_bytes, format="audio/wav")
-
-
-# ---- Run the app ---------------------------------------------------------------
-# This "if" line is a common Python pattern: it means "only run main() when this
-# file is executed directly (like `streamlit run app.py`)", not when it's imported.
-
-if __name__ == "__main__":
-    main()
+st.text("")
