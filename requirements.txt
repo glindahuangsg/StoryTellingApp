@@ -1,9 +1,8 @@
-streamlit
-torch
-transformers
-accelerate
-pillow
-numpy
-soundfile
-datasets
-sentencepiece
+streamlit>=1.40,<2.0
+torch>=2.6
+transformers>=5.0,<6.0
+accelerate>=1.0
+pillow>=10.0
+numpy>=2.0
+soundfile>=0.12
+sentencepiece>=0.2
