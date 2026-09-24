@@ -54,7 +54,16 @@ def caption_to_story(caption):
         "Write a short, gentle story for young children based on this scene: "
         f"'{caption}'. The story should be about 50 to 100 words long."
     )
-    result = story_model(prompt, max_new_tokens=180, min_new_tokens=60)
+    result = story_model(
+        prompt,
+        max_new_tokens=180,
+        min_new_tokens=60,
+        # These two settings stop the model from getting "stuck" and looping
+        # the same phrase over and over when pushed past what it would
+        # naturally write (which is what min_new_tokens above does).
+        no_repeat_ngram_size=3,   # never repeat the same 3-word phrase twice
+        repetition_penalty=1.3,   # discourage reusing recent words in general
+    )
     return result[0]["generated_text"]
 
 
