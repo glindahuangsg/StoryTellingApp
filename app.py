@@ -53,6 +53,7 @@
 """
 
 import io
+import re
 
 import numpy as np
 import soundfile as sf
@@ -323,15 +324,29 @@ def generate_story(caption: str, story_generator, min_words: int, max_words: int
             prompt,
             max_new_tokens=max_new_tokens,
             min_new_tokens=min_new_tokens,
-            do_sample=True,     # sampling (rather than greedy decoding) gives more
-            temperature=0.9,    # varied, "storybook" language instead of flat text
+            do_sample=True,          # sampling (rather than greedy decoding) gives more
+            temperature=0.9,         # varied, "storybook" language instead of flat text
             top_p=0.95,
+            # Forcing a minimum length (min_new_tokens above) can push a small model
+            # past the point where it has anything new left to say, and it falls back
+            # to looping the same sentence over and over to pad out the length. These
+            # two settings stop that: no_repeat_ngram_size hard-blocks any 3-word
+            # sequence from recurring, and repetition_penalty discourages the model
+            # from reusing recent words/phrases even below that hard block.
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.3,
         )
         story_text = output[0]["generated_text"].strip()
 
         word_count = len(story_text.split())
         if word_count >= min_words:
             break  # length requirement met, no need to retry
+
+    # Belt-and-suspenders: even with the generation-time guards above, collapse any
+    # sentence that immediately repeats the one before it (exact or near-exact,
+    # ignoring case/punctuation), so a repeated-sentence loop can never reach the
+    # child even if it slips past the generation settings.
+    story_text = remove_consecutive_repeated_sentences(story_text)
 
     # If the story ended up longer than max_words, trim it to the last full
     # sentence at or before the limit, so it doesn't cut off mid-sentence.
@@ -342,6 +357,42 @@ def generate_story(caption: str, story_generator, min_words: int, max_words: int
         story_text = trimmed[: last_period_index + 1] if last_period_index != -1 else trimmed + "."
 
     return story_text
+
+
+def remove_consecutive_repeated_sentences(text: str) -> str:
+    """
+    Collapse any sentence that immediately repeats the sentence before it.
+
+    Small language models forced to hit a minimum length sometimes fall back
+    to looping the same sentence rather than inventing new content. This is a
+    safety net that runs after generation: it splits the story into
+    sentences, drops a sentence if it's essentially identical (ignoring case,
+    punctuation, and extra spaces) to the one right before it, and rejoins
+    what's left — so a repeat loop can never reach the child even if the
+    generation-time settings above don't fully prevent it.
+
+    Args:
+        text: the raw generated story text.
+
+    Returns:
+        The story text with consecutive duplicate sentences removed.
+    """
+    # Split into sentences, keeping the punctuation that ends each one.
+    sentence_pattern = re.compile(r"[^.!?]+[.!?]*")
+    raw_sentences = [s.strip() for s in sentence_pattern.findall(text) if s.strip()]
+
+    deduped_sentences = []
+    previous_normalized = None
+    for sentence in raw_sentences:
+        # Normalize for comparison only (lowercase, strip punctuation/spacing);
+        # the original wording/punctuation is what actually gets kept.
+        normalized = re.sub(r"[^a-z0-9 ]", "", sentence.lower()).strip()
+        if normalized and normalized == previous_normalized:
+            continue  # skip this sentence, it just repeats the one before it
+        deduped_sentences.append(sentence)
+        previous_normalized = normalized
+
+    return " ".join(deduped_sentences)
 
 
 def text_to_speech(story_text: str, tts_pipeline) -> io.BytesIO:
@@ -464,15 +515,24 @@ def get_story_length_choice() -> tuple:
 
 
 def reset_for_new_story() -> None:
-    """Clear the current picture so the child can start a fresh story."""
+    """Clear the current picture and any generated story so the child can start over."""
     st.session_state.uploader_generation = st.session_state.get("uploader_generation", 0) + 1
+    st.session_state.story_result = None
     st.rerun()
 
 
 def run_storytelling_pipeline(image: Image.Image, min_words: int, max_words: int) -> None:
     """
     Run the full caption -> story -> audio pipeline for a given image and
-    render the results in the Streamlit UI.
+    save the results into `st.session_state.story_result`.
+
+    Results are stored in session state — rather than rendered directly here
+    and only here — for two reasons: (1) it lets `main()` show a completely
+    separate "results screen" instead of stacking results below the setup
+    screen, which is what caused unnecessary scrolling; and (2) it makes the
+    story/audio survive later reruns (e.g. clicking the download button,
+    which itself triggers a Streamlit rerun) instead of vanishing because the
+    "Make My Story!" button is no longer the thing that was just clicked.
 
     Args:
         image: the PIL image to turn into a story.
@@ -495,38 +555,19 @@ def run_storytelling_pipeline(image: Image.Image, min_words: int, max_words: int
             tts_pipeline = load_tts_model()
             audio_buffer = text_to_speech(story, tts_pipeline)
 
-        # --- Display results ---
+        # Store plain bytes (not the PIL image / BytesIO objects themselves) in
+        # session state — bytes are simple, always re-readable from the start,
+        # and avoid any "already consumed" position issues on later reruns.
+        image_bytes_buffer = io.BytesIO()
+        image.save(image_bytes_buffer, format="PNG")
+
+        st.session_state.story_result = {
+            "caption": caption,
+            "story": story,
+            "audio_bytes": audio_buffer.getvalue(),
+            "image_bytes": image_bytes_buffer.getvalue(),
+        }
         st.balloons()  # a fun, wordless "ta-da!" moment for kids who can't read yet
-
-        st.markdown("### 📝 Your Story")
-        st.write(story)
-
-        word_count = len(story.split())
-        st.caption(f"Word count: {word_count} words")  # for parents/grading reference
-
-        st.markdown("### 🎧 Listen!")
-        # autoplay=True starts the story reading itself as soon as it's ready —
-        # important for a child who can't yet read "press play".
-        st.audio(audio_buffer, format="audio/wav", autoplay=True)
-
-        # Give the download button a fresh copy of the buffer, since st.audio()
-        # may already have consumed/read from the original position.
-        audio_buffer.seek(0)
-        st.download_button(
-            label="⬇️ 🎵 Save the Story",
-            data=audio_buffer,
-            file_name="my_story.wav",
-            mime="audio/wav",
-        )
-
-        # Show the intermediate caption too — useful for grading/demoing that
-        # the image-captioning step genuinely ran.
-        with st.expander("🔍 See what the AI noticed in your picture"):
-            st.write(f"Image caption: *{caption}*")
-
-        st.markdown("&nbsp;", unsafe_allow_html=True)
-        if st.button("🔁 Make Another Story!"):
-            reset_for_new_story()
 
     except Exception as error:
         # Friendly, non-technical message for the app's young audience/parents.
@@ -538,12 +579,14 @@ def run_storytelling_pipeline(image: Image.Image, min_words: int, max_words: int
         st.exception(error)
 
 
-def main() -> None:
+def render_setup_screen() -> None:
     """
-    Main entry point of the Streamlit app. Wires together the UI and the
-    caption -> story -> audio pipeline described at the top of this file.
+    Render the "before" screen: title, picture input, story-length choice,
+    and the big "Make My Story!" button. Shown only while there is no
+    generated story yet — once one exists, `main()` shows the results screen
+    instead of stacking it below this one, which is what used to force
+    scrolling.
     """
-    apply_kid_friendly_theme()
     render_header()
 
     image = get_user_image()
@@ -562,6 +605,69 @@ def main() -> None:
     # A single button triggers the whole pipeline, so kids only need one click.
     if st.button("✨ Make My Story! ✨"):
         run_storytelling_pipeline(image, min_words, max_words)
+        # Rerun immediately so this same script execution redraws the page
+        # from the top and main() picks the results screen this time,
+        # instead of this setup screen continuing to render below it.
+        st.rerun()
+
+
+def render_story_result(result: dict) -> None:
+    """
+    Render the "after" screen: the finished story, its audio, and controls —
+    replacing the setup screen entirely rather than appearing below it, so
+    there's much less to scroll through to see and hear the result.
+
+    Args:
+        result: the dict saved by `run_storytelling_pipeline` into
+            `st.session_state.story_result` (caption, story, audio_bytes,
+            image_bytes).
+    """
+    st.title("🧸✨ Your Story! ✨🧸")
+
+    left, middle, right = st.columns([1, 2, 1])
+    with middle:
+        st.image(io.BytesIO(result["image_bytes"]), width=200)
+
+    st.write(result["story"])
+    word_count = len(result["story"].split())
+    st.caption(f"Word count: {word_count} words")  # for parents/grading reference
+
+    # autoplay=True starts the story reading itself as soon as it's ready —
+    # important for a child who can't yet read "press play".
+    st.audio(result["audio_bytes"], format="audio/wav", autoplay=True)
+
+    st.download_button(
+        label="⬇️ 🎵 Save the Story",
+        data=result["audio_bytes"],
+        file_name="my_story.wav",
+        mime="audio/wav",
+    )
+
+    # Show the intermediate caption too — useful for grading/demoing that
+    # the image-captioning step genuinely ran. Collapsed by default to keep
+    # this screen short.
+    with st.expander("🔍 See what the AI noticed in your picture"):
+        st.write(f"Image caption: *{result['caption']}*")
+
+    if st.button("🔁 Make Another Story!"):
+        reset_for_new_story()
+
+
+def main() -> None:
+    """
+    Main entry point of the Streamlit app. Shows exactly one screen at a
+    time — the setup screen or the results screen — rather than stacking
+    both, so the child rarely needs to scroll to see everything relevant.
+    """
+    if "story_result" not in st.session_state:
+        st.session_state.story_result = None
+
+    apply_kid_friendly_theme()
+
+    if st.session_state.story_result is not None:
+        render_story_result(st.session_state.story_result)
+    else:
+        render_setup_screen()
 
 
 if __name__ == "__main__":
