@@ -1,21 +1,22 @@
 import gc
 import io
-import sys
+import re
 
+import numpy as np
+import soundfile as sf
 import streamlit as st
 import torch
-import soundfile as sf
 
 from PIL import Image
 
 from transformers import (
-    BlipProcessor,
     BlipForConditionalGeneration,
-    AutoTokenizer,
+    BlipProcessor,
     AutoModelForCausalLM,
-    SpeechT5Processor,
+    AutoTokenizer,
     SpeechT5ForTextToSpeech,
     SpeechT5HifiGan,
+    SpeechT5Processor,
 )
 
 from huggingface_hub import hf_hub_download
@@ -33,22 +34,8 @@ TTS_MODEL = "microsoft/speecht5_tts"
 
 TTS_VOCODER = "microsoft/speecht5_hifigan"
 
-# Parquet version of the CMU Arctic speaker embeddings.
-#
-# We deliberately do NOT use:
-#
-#   datasets.load_dataset(
-#       "Matthijs/cmu-arctic-xvectors"
-#   )
-#
-# because that repository uses an old Python dataset
-# loading script.
-#
-# Instead, we download a single .npy speaker embedding.
 SPEAKER_REPO = "Matthijs/cmu-arctic-xvectors"
 
-# This is the speaker embedding used in Hugging Face's
-# SpeechT5 example.
 SPEAKER_INDEX = 7306
 
 SAMPLE_RATE = 16000
@@ -64,7 +51,7 @@ DEVICE = torch.device(
 
 
 # ============================================================
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -75,7 +62,7 @@ st.set_page_config(
 
 
 # ============================================================
-# CHILD-FRIENDLY CSS
+# CUSTOM CSS
 # ============================================================
 
 def add_custom_css():
@@ -144,29 +131,16 @@ def cleanup_memory():
 def load_speaker_embedding():
 
     """
-    Load one 512-dimensional SpeechT5 speaker embedding.
+    Download one SpeechT5 speaker embedding.
 
-    We intentionally avoid load_dataset() because the original
-    cmu-arctic-xvectors repository contains a Python dataset
-    loading script that newer versions of `datasets` refuse
-    to execute.
+    We intentionally DO NOT use:
+
+        datasets.load_dataset()
+
+    because the original CMU Arctic repository contains
+    an old Python dataset loading script that newer versions
+    of the datasets package no longer support.
     """
-
-    import numpy as np
-
-    # --------------------------------------------------------
-    # IMPORTANT
-    #
-    # The original dataset contains one .npy file per utterance.
-    #
-    # The files are stored inside:
-    #
-    # spkrec-xvect.zip
-    #
-    # Instead of downloading and processing the entire dataset,
-    # we use the Hugging Face Hub API to download the archive,
-    # then extract the one speaker vector we need.
-    # --------------------------------------------------------
 
     zip_path = hf_hub_download(
         repo_id=SPEAKER_REPO,
@@ -175,15 +149,11 @@ def load_speaker_embedding():
     )
 
     import zipfile
-    import os
 
-    # The original dataset is sorted by filename when it
-    # generates its validation split.
-    #
-    # We reproduce that ordering here so index 7306 corresponds
-    # to the same speaker vector used by the Hugging Face example.
-
-    with zipfile.ZipFile(zip_path, "r") as archive:
+    with zipfile.ZipFile(
+        zip_path,
+        "r",
+    ) as archive:
 
         npy_files = [
             name
@@ -202,21 +172,17 @@ def load_speaker_embedding():
 
         selected_file = npy_files[SPEAKER_INDEX]
 
-        with archive.open(selected_file) as file:
+        with archive.open(
+            selected_file
+        ) as file:
 
             embedding = np.load(file)
-
-    # Convert NumPy array → PyTorch tensor.
 
     embedding = torch.tensor(
         embedding,
         dtype=torch.float32,
     )
 
-    # SpeechT5 expects:
-    #
-    # [batch_size, 512]
-    #
     if embedding.ndim == 1:
 
         embedding = embedding.unsqueeze(0)
@@ -233,7 +199,7 @@ def load_speaker_embedding():
 
 
 # ============================================================
-# IMAGE → TEXT
+# IMAGE → DESCRIPTION
 # ============================================================
 
 def image_to_text(image):
@@ -315,15 +281,17 @@ def generate_story(
         model.eval()
 
         # ----------------------------------------------------
-        # Age
+        # Age-specific length
         # ----------------------------------------------------
 
         if age_group == "3–5":
 
             length_instruction = (
-                "Write 3 to 5 very short sentences. "
+                "Write exactly 3 to 5 very short sentences. "
                 "Use very simple words."
             )
+
+            max_tokens = 80
 
         elif age_group == "6–7":
 
@@ -332,6 +300,8 @@ def generate_story(
                 "Use simple words and playful descriptions."
             )
 
+            max_tokens = 110
+
         else:
 
             length_instruction = (
@@ -339,8 +309,10 @@ def generate_story(
                 "Use imaginative but easy-to-understand language."
             )
 
+            max_tokens = 140
+
         # ----------------------------------------------------
-        # Style
+        # Story style
         # ----------------------------------------------------
 
         styles = {
@@ -368,7 +340,7 @@ def generate_story(
         # ----------------------------------------------------
 
         prompt = f"""
-You are a children's story writer.
+You are a friendly children's story writer.
 
 The picture shows:
 {description}
@@ -424,7 +396,7 @@ Story:
 
             output = model.generate(
                 **inputs,
-                max_new_tokens=140,
+                max_new_tokens=max_tokens,
                 do_sample=True,
                 temperature=0.7,
                 top_p=0.9,
@@ -458,6 +430,108 @@ Story:
 
 
 # ============================================================
+# SPLIT TEXT FOR SPEECHT5
+# ============================================================
+
+def split_text_for_tts(
+    text,
+    max_chars=150,
+):
+
+    """
+    SpeechT5 has a maximum sequence length.
+
+    Instead of sending an entire story to SpeechT5,
+    divide it into short chunks and synthesize each
+    chunk separately.
+
+    max_chars is deliberately conservative.
+    """
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    if not text:
+
+        return []
+
+    # Split into sentences.
+
+    sentences = re.split(
+        r"(?<=[.!?])\s+",
+        text,
+    )
+
+    chunks = []
+
+    current = ""
+
+    for sentence in sentences:
+
+        sentence = sentence.strip()
+
+        if not sentence:
+
+            continue
+
+        candidate = (
+            f"{current} {sentence}".strip()
+        )
+
+        if len(candidate) <= max_chars:
+
+            current = candidate
+
+        else:
+
+            if current:
+
+                chunks.append(current)
+
+            # If a single sentence is too long,
+            # split it by words.
+
+            if len(sentence) > max_chars:
+
+                words = sentence.split()
+
+                current = ""
+
+                for word in words:
+
+                    candidate = (
+                        f"{current} {word}".strip()
+                    )
+
+                    if len(candidate) <= max_chars:
+
+                        current = candidate
+
+                    else:
+
+                        if current:
+
+                            chunks.append(
+                                current
+                            )
+
+                        current = word
+
+            else:
+
+                current = sentence
+
+    if current:
+
+        chunks.append(current)
+
+    return chunks
+
+
+# ============================================================
 # TEXT → SPEECH
 # ============================================================
 
@@ -469,37 +543,37 @@ def text_to_speech(text):
 
     try:
 
-        # ----------------------------------------------------
-        # Limit the amount of text.
-        #
-        # SpeechT5 can be slow on long stories, especially
-        # on CPU-based Streamlit deployments.
-        # ----------------------------------------------------
-
         text = text.strip()
-
-        if len(text) > 1000:
-
-            text = text[:1000]
-
-            # Don't cut in the middle of a word.
-
-            last_space = text.rfind(" ")
-
-            if last_space > 100:
-
-                text = text[:last_space]
 
         if not text:
 
             raise ValueError(
-                "There is no story text to convert to speech."
+                "There is no story to read."
             )
 
         # ----------------------------------------------------
-        # Load speaker embedding FIRST.
-        #
-        # This tests the problematic part separately.
+        # Split the story BEFORE tokenization.
+        # ----------------------------------------------------
+
+        chunks = split_text_for_tts(
+            text,
+            max_chars=150,
+        )
+
+        if not chunks:
+
+            raise ValueError(
+                "The story could not be split into "
+                "readable pieces."
+            )
+
+        st.info(
+            f"🔊 Reading the story in "
+            f"{len(chunks)} short parts..."
+        )
+
+        # ----------------------------------------------------
+        # Speaker embedding
         # ----------------------------------------------------
 
         speaker_embedding = (
@@ -511,7 +585,7 @@ def text_to_speech(text):
         )
 
         # ----------------------------------------------------
-        # Load processor
+        # Processor
         # ----------------------------------------------------
 
         processor = SpeechT5Processor.from_pretrained(
@@ -519,7 +593,7 @@ def text_to_speech(text):
         )
 
         # ----------------------------------------------------
-        # Load TTS model
+        # TTS model
         # ----------------------------------------------------
 
         model = SpeechT5ForTextToSpeech.from_pretrained(
@@ -530,7 +604,7 @@ def text_to_speech(text):
         model.eval()
 
         # ----------------------------------------------------
-        # Load vocoder
+        # Vocoder
         # ----------------------------------------------------
 
         vocoder = SpeechT5HifiGan.from_pretrained(
@@ -541,50 +615,113 @@ def text_to_speech(text):
         vocoder.eval()
 
         # ----------------------------------------------------
-        # Prepare text
+        # Generate audio chunk by chunk
         # ----------------------------------------------------
 
-        inputs = processor(
-            text=text,
-            return_tensors="pt",
+        audio_chunks = []
+
+        progress = st.progress(
+            0,
+            text="Preparing the storyteller..."
         )
 
-        input_ids = inputs[
-            "input_ids"
-        ].to(DEVICE)
+        for index, chunk in enumerate(chunks):
 
-        # ----------------------------------------------------
-        # Generate audio
-        # ----------------------------------------------------
-
-        with torch.no_grad():
-
-            speech = model.generate_speech(
-                input_ids,
-                speaker_embedding,
-                vocoder=vocoder,
+            progress.progress(
+                (index + 1) / len(chunks),
+                text=(
+                    f"🔊 Reading part "
+                    f"{index + 1} of "
+                    f"{len(chunks)}..."
+                ),
             )
 
+            # ----------------------------------------------
+            # Tokenize ONE chunk
+            # ----------------------------------------------
+
+            inputs = processor(
+                text=chunk,
+                return_tensors="pt",
+            )
+
+            input_ids = inputs[
+                "input_ids"
+            ].to(DEVICE)
+
+            token_count = input_ids.shape[1]
+
+            # ----------------------------------------------
+            # Safety check.
+            #
+            # SpeechT5 has a 600-token limit. We use a
+            # conservative 450-token limit here.
+            # ----------------------------------------------
+
+            if token_count >= 450:
+
+                raise ValueError(
+                    "Speech chunk is still too long: "
+                    f"{token_count} tokens. "
+                    "Try making the story shorter."
+                )
+
+            # ----------------------------------------------
+            # Generate speech
+            # ----------------------------------------------
+
+            with torch.no_grad():
+
+                speech = model.generate_speech(
+                    input_ids,
+                    speaker_embedding,
+                    vocoder=vocoder,
+                )
+
+            # ----------------------------------------------
+            # CPU NumPy
+            # ----------------------------------------------
+
+            speech = (
+                speech
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+            audio_chunks.append(
+                speech
+            )
+
+            del inputs
+            del input_ids
+            del speech
+
+        progress.empty()
+
         # ----------------------------------------------------
-        # Convert to NumPy
+        # Combine chunks
         # ----------------------------------------------------
 
-        speech = (
-            speech
-            .detach()
-            .cpu()
-            .numpy()
+        if not audio_chunks:
+
+            raise RuntimeError(
+                "SpeechT5 did not generate any audio."
+            )
+
+        combined_audio = np.concatenate(
+            audio_chunks
         )
 
         # ----------------------------------------------------
-        # WAV
+        # Create WAV
         # ----------------------------------------------------
 
         audio_buffer = io.BytesIO()
 
         sf.write(
             audio_buffer,
-            speech,
+            combined_audio,
             SAMPLE_RATE,
             format="WAV",
         )
@@ -596,7 +733,7 @@ def text_to_speech(text):
         if not audio_bytes:
 
             raise RuntimeError(
-                "SpeechT5 returned empty audio."
+                "The generated WAV file is empty."
             )
 
         return audio_bytes
@@ -638,7 +775,7 @@ def reset_story():
 
 
 # ============================================================
-# MAIN
+# MAIN APPLICATION
 # ============================================================
 
 def main():
@@ -664,7 +801,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Story settings
+    # Settings
     # --------------------------------------------------------
 
     st.subheader("✨ Choose your story")
@@ -695,7 +832,7 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Image upload
+    # Image
     # --------------------------------------------------------
 
     st.subheader("📸 Choose a picture")
@@ -759,7 +896,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Make story
+    # Generate story
     # --------------------------------------------------------
 
     if st.button(
@@ -771,7 +908,7 @@ def main():
         reset_story()
 
         # ----------------------------------------------------
-        # Vision
+        # Image → Description
         # ----------------------------------------------------
 
         with st.spinner(
@@ -787,7 +924,7 @@ def main():
         ] = description
 
         # ----------------------------------------------------
-        # Story
+        # Description → Story
         # ----------------------------------------------------
 
         with st.spinner(
@@ -805,7 +942,7 @@ def main():
         ] = story
 
     # --------------------------------------------------------
-    # Description
+    # Image description
     # --------------------------------------------------------
 
     if "description" in st.session_state:
@@ -886,17 +1023,13 @@ def main():
         ):
 
             st.audio(
-                st.session_state[
-                    "audio"
-                ],
+                st.session_state["audio"],
                 format="audio/wav",
             )
 
             st.download_button(
                 label="⬇️ Download audio",
-                data=st.session_state[
-                    "audio"
-                ],
+                data=st.session_state["audio"],
                 file_name="my_story.wav",
                 mime="audio/wav",
                 use_container_width=True,
