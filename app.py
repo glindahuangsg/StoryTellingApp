@@ -63,10 +63,10 @@ def load_vision_model():
         VISION_MODEL
     )
 
-model = AutoModelForMultimodalLM.from_pretrained(
+    model = AutoModelForMultimodalLM.from_pretrained(
     VISION_MODEL,
     torch_dtype=DTYPE,
-)
+    )
 
     model.to(DEVICE)
 
