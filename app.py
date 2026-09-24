@@ -18,7 +18,7 @@ from transformers import (
     SpeechT5HifiGan,
 )
 
-from datasets import load_dataset
+from huggingface_hub import hf_hub_download
 
 
 # ============================================================
@@ -33,12 +33,24 @@ TTS_MODEL = "microsoft/speecht5_tts"
 
 TTS_VOCODER = "microsoft/speecht5_hifigan"
 
-SPEAKER_DATASET = "Matthijs/cmu-arctic-xvectors"
+# Parquet version of the CMU Arctic speaker embeddings.
+#
+# We deliberately do NOT use:
+#
+#   datasets.load_dataset(
+#       "Matthijs/cmu-arctic-xvectors"
+#   )
+#
+# because that repository uses an old Python dataset
+# loading script.
+#
+# Instead, we download a single .npy speaker embedding.
+SPEAKER_REPO = "Matthijs/cmu-arctic-xvectors"
 
-# Hugging Face's SpeechT5 example uses this speaker embedding.
+# This is the speaker embedding used in Hugging Face's
+# SpeechT5 example.
 SPEAKER_INDEX = 7306
 
-# SpeechT5 generates audio at 16 kHz.
 SAMPLE_RATE = 16000
 
 
@@ -52,7 +64,7 @@ DEVICE = torch.device(
 
 
 # ============================================================
-# PAGE
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -63,7 +75,7 @@ st.set_page_config(
 
 
 # ============================================================
-# CSS
+# CHILD-FRIENDLY CSS
 # ============================================================
 
 def add_custom_css():
@@ -95,6 +107,7 @@ def add_custom_css():
             font-size: 20px;
             line-height: 1.7;
             margin-top: 15px;
+            margin-bottom: 20px;
         }
 
         .hint-box {
@@ -130,13 +143,73 @@ def cleanup_memory():
 @st.cache_resource
 def load_speaker_embedding():
 
-    dataset = load_dataset(
-        SPEAKER_DATASET,
-        split="validation",
+    """
+    Load one 512-dimensional SpeechT5 speaker embedding.
+
+    We intentionally avoid load_dataset() because the original
+    cmu-arctic-xvectors repository contains a Python dataset
+    loading script that newer versions of `datasets` refuse
+    to execute.
+    """
+
+    import numpy as np
+
+    # --------------------------------------------------------
+    # IMPORTANT
+    #
+    # The original dataset contains one .npy file per utterance.
+    #
+    # The files are stored inside:
+    #
+    # spkrec-xvect.zip
+    #
+    # Instead of downloading and processing the entire dataset,
+    # we use the Hugging Face Hub API to download the archive,
+    # then extract the one speaker vector we need.
+    # --------------------------------------------------------
+
+    zip_path = hf_hub_download(
+        repo_id=SPEAKER_REPO,
+        filename="spkrec-xvect.zip",
+        repo_type="dataset",
     )
 
+    import zipfile
+    import os
+
+    # The original dataset is sorted by filename when it
+    # generates its validation split.
+    #
+    # We reproduce that ordering here so index 7306 corresponds
+    # to the same speaker vector used by the Hugging Face example.
+
+    with zipfile.ZipFile(zip_path, "r") as archive:
+
+        npy_files = [
+            name
+            for name in archive.namelist()
+            if name.endswith(".npy")
+        ]
+
+        npy_files.sort()
+
+        if SPEAKER_INDEX >= len(npy_files):
+
+            raise RuntimeError(
+                f"Speaker index {SPEAKER_INDEX} is unavailable. "
+                f"Found {len(npy_files)} speaker files."
+            )
+
+        selected_file = npy_files[SPEAKER_INDEX]
+
+        with archive.open(selected_file) as file:
+
+            embedding = np.load(file)
+
+    # Convert NumPy array → PyTorch tensor.
+
     embedding = torch.tensor(
-        dataset[SPEAKER_INDEX]["xvector"],
+        embedding,
         dtype=torch.float32,
     )
 
@@ -144,15 +217,23 @@ def load_speaker_embedding():
     #
     # [batch_size, 512]
     #
-    # The x-vector is 512-dimensional.
+    if embedding.ndim == 1:
 
-    embedding = embedding.unsqueeze(0)
+        embedding = embedding.unsqueeze(0)
+
+    if embedding.shape != (1, 512):
+
+        raise RuntimeError(
+            "Invalid speaker embedding shape: "
+            f"{embedding.shape}. "
+            "Expected (1, 512)."
+        )
 
     return embedding
 
 
 # ============================================================
-# IMAGE → DESCRIPTION
+# IMAGE → TEXT
 # ============================================================
 
 def image_to_text(image):
@@ -162,8 +243,6 @@ def image_to_text(image):
 
     try:
 
-        st.info("👀 Looking at the picture...")
-
         processor = BlipProcessor.from_pretrained(
             VISION_MODEL
         )
@@ -172,15 +251,12 @@ def image_to_text(image):
             VISION_MODEL
         )
 
-        model = model.to(DEVICE)
-
+        model.to(DEVICE)
         model.eval()
-
-        prompt = "a picture of"
 
         inputs = processor(
             images=image,
-            text=prompt,
+            text="a picture of",
             return_tensors="pt",
         )
 
@@ -227,8 +303,6 @@ def generate_story(
 
     try:
 
-        st.info("🪄 Creating your story...")
-
         tokenizer = AutoTokenizer.from_pretrained(
             TEXT_MODEL
         )
@@ -237,27 +311,25 @@ def generate_story(
             TEXT_MODEL
         )
 
-        model = model.to(DEVICE)
-
+        model.to(DEVICE)
         model.eval()
 
         # ----------------------------------------------------
-        # Age-specific instructions
+        # Age
         # ----------------------------------------------------
 
         if age_group == "3–5":
 
             length_instruction = (
                 "Write 3 to 5 very short sentences. "
-                "Use simple words that a preschool child "
-                "can understand."
+                "Use very simple words."
             )
 
         elif age_group == "6–7":
 
             length_instruction = (
                 "Write 5 to 7 short sentences. "
-                "Use simple vocabulary and playful details."
+                "Use simple words and playful descriptions."
             )
 
         else:
@@ -296,32 +368,29 @@ def generate_story(
         # ----------------------------------------------------
 
         prompt = f"""
-You are writing a short story for a child.
+You are a children's story writer.
 
-Picture description:
+The picture shows:
 {description}
 
-Child age:
-{age_group}
-
-Story style:
-{style_instruction}
+The child is {age_group} years old.
 
 {length_instruction}
 
+{style_instruction}
+
 Rules:
 
-- Be kind and positive.
-- Make the story imaginative.
+- Make the story warm and imaginative.
 - Keep it safe for children.
 - Do not include violence.
 - Do not include weapons.
 - Do not include frightening scenes.
 - Do not include adult topics.
 - Do not include dangerous instructions.
-- Do not mention artificial intelligence.
-- Do not talk about these instructions.
-- Do not invent personal information about real people.
+- Do not mention AI.
+- Do not mention these instructions.
+- Do not invent personal information about people.
 - End with a happy or reassuring feeling.
 - Write only the story.
 
@@ -335,7 +404,6 @@ Story:
             }
         ]
 
-        # SmolLM2 supports the chat template.
         input_text = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -402,7 +470,48 @@ def text_to_speech(text):
     try:
 
         # ----------------------------------------------------
-        # Load SpeechT5 processor
+        # Limit the amount of text.
+        #
+        # SpeechT5 can be slow on long stories, especially
+        # on CPU-based Streamlit deployments.
+        # ----------------------------------------------------
+
+        text = text.strip()
+
+        if len(text) > 1000:
+
+            text = text[:1000]
+
+            # Don't cut in the middle of a word.
+
+            last_space = text.rfind(" ")
+
+            if last_space > 100:
+
+                text = text[:last_space]
+
+        if not text:
+
+            raise ValueError(
+                "There is no story text to convert to speech."
+            )
+
+        # ----------------------------------------------------
+        # Load speaker embedding FIRST.
+        #
+        # This tests the problematic part separately.
+        # ----------------------------------------------------
+
+        speaker_embedding = (
+            load_speaker_embedding()
+        )
+
+        speaker_embedding = (
+            speaker_embedding.to(DEVICE)
+        )
+
+        # ----------------------------------------------------
+        # Load processor
         # ----------------------------------------------------
 
         processor = SpeechT5Processor.from_pretrained(
@@ -410,56 +519,29 @@ def text_to_speech(text):
         )
 
         # ----------------------------------------------------
-        # Load SpeechT5 model
+        # Load TTS model
         # ----------------------------------------------------
 
         model = SpeechT5ForTextToSpeech.from_pretrained(
             TTS_MODEL
         )
 
-        model = model.to(DEVICE)
-
+        model.to(DEVICE)
         model.eval()
 
         # ----------------------------------------------------
-        # Load HiFi-GAN
+        # Load vocoder
         # ----------------------------------------------------
 
         vocoder = SpeechT5HifiGan.from_pretrained(
             TTS_VOCODER
         )
 
-        vocoder = vocoder.to(DEVICE)
-
+        vocoder.to(DEVICE)
         vocoder.eval()
 
         # ----------------------------------------------------
-        # Speaker embedding
-        # ----------------------------------------------------
-
-        speaker_embedding = (
-            load_speaker_embedding()
-            .to(DEVICE)
-        )
-
-        # Make absolutely sure the shape is [1, 512].
-        if speaker_embedding.ndim == 1:
-
-            speaker_embedding = (
-                speaker_embedding
-                .unsqueeze(0)
-            )
-
-        if speaker_embedding.shape != (1, 512):
-
-            raise ValueError(
-                "Invalid speaker embedding shape: "
-                f"{speaker_embedding.shape}. "
-                "Expected [1, 512]."
-            )
-
-        # ----------------------------------------------------
-        # Process text
+        # Prepare text
         # ----------------------------------------------------
 
         inputs = processor(
@@ -472,7 +554,7 @@ def text_to_speech(text):
         ].to(DEVICE)
 
         # ----------------------------------------------------
-        # Generate speech
+        # Generate audio
         # ----------------------------------------------------
 
         with torch.no_grad():
@@ -484,13 +566,18 @@ def text_to_speech(text):
             )
 
         # ----------------------------------------------------
-        # Convert tensor → NumPy
+        # Convert to NumPy
         # ----------------------------------------------------
 
-        speech = speech.detach().cpu().numpy()
+        speech = (
+            speech
+            .detach()
+            .cpu()
+            .numpy()
+        )
 
         # ----------------------------------------------------
-        # Create WAV in memory
+        # WAV
         # ----------------------------------------------------
 
         audio_buffer = io.BytesIO()
@@ -509,19 +596,16 @@ def text_to_speech(text):
         if not audio_bytes:
 
             raise RuntimeError(
-                "SpeechT5 generated an empty audio file."
+                "SpeechT5 returned empty audio."
             )
 
         return audio_bytes
 
     except Exception as error:
 
-        # ----------------------------------------------------
-        # Show real error during development
-        # ----------------------------------------------------
-
         st.error(
-            f"TTS error: {type(error).__name__}: {error}"
+            "TTS error: "
+            f"{type(error).__name__}: {error}"
         )
 
         return None
@@ -580,7 +664,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Settings
+    # Story settings
     # --------------------------------------------------------
 
     st.subheader("✨ Choose your story")
@@ -611,7 +695,7 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Upload image
+    # Image upload
     # --------------------------------------------------------
 
     st.subheader("📸 Choose a picture")
@@ -675,7 +759,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Generate story
+    # Make story
     # --------------------------------------------------------
 
     if st.button(
@@ -684,25 +768,10 @@ def main():
         use_container_width=True,
     ):
 
-        # Clear old results.
-
-        st.session_state.pop(
-            "description",
-            None,
-        )
-
-        st.session_state.pop(
-            "story",
-            None,
-        )
-
-        st.session_state.pop(
-            "audio",
-            None,
-        )
+        reset_story()
 
         # ----------------------------------------------------
-        # Image → Text
+        # Vision
         # ----------------------------------------------------
 
         with st.spinner(
@@ -718,7 +787,7 @@ def main():
         ] = description
 
         # ----------------------------------------------------
-        # Text → Story
+        # Story
         # ----------------------------------------------------
 
         with st.spinner(
@@ -761,10 +830,6 @@ def main():
 
         st.subheader("📖 Your Story")
 
-        # Use st.markdown rather than injecting the generated
-        # story into HTML. This prevents generated text from
-        # being interpreted as HTML.
-
         st.markdown(
             '<div class="story-box">',
             unsafe_allow_html=True,
@@ -780,12 +845,12 @@ def main():
         )
 
         # ----------------------------------------------------
-        # TTS
+        # Audio
         # ----------------------------------------------------
 
-        st.divider()
-
-        st.subheader("🔊 Listen to your story")
+        st.subheader(
+            "🔊 Listen to your story"
+        )
 
         if st.button(
             "🎵 Read My Story",
@@ -821,13 +886,17 @@ def main():
         ):
 
             st.audio(
-                st.session_state["audio"],
+                st.session_state[
+                    "audio"
+                ],
                 format="audio/wav",
             )
 
             st.download_button(
                 label="⬇️ Download audio",
-                data=st.session_state["audio"],
+                data=st.session_state[
+                    "audio"
+                ],
                 file_name="my_story.wav",
                 mime="audio/wav",
                 use_container_width=True,
@@ -850,7 +919,7 @@ def main():
 
 
 # ============================================================
-# RUN
+# ENTRY POINT
 # ============================================================
 
 if __name__ == "__main__":
