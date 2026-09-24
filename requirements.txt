@@ -6,28 +6,32 @@
 # is 800MB-2GB+). The full wheel routinely times out or runs out of memory during a
 # Streamlit Community Cloud build.
 #
-# torch is deliberately left UNPINNED on patch version (only "==2.9.*+cpu") rather
-# than an exact version like "2.4.1+cpu": Streamlit Cloud's Python runtime can change
-# (e.g. it currently provisions Python 3.13, which has no PyTorch build before 2.9.0),
-# and an exact old pin causes "Could not find a version that satisfies the
-# requirement" build failures whenever the runtime's Python version moves. If you
-# want fully reproducible builds instead, add a runtime.txt / set the Python version
-# explicitly in the app's Advanced settings and pin an exact "+cpu" version that
-# exists for that Python version.
+# torch is pinned to 2.9.1+cpu because that is the oldest CPU-only build confirmed
+# available for Streamlit Cloud's current Python runtime (Python 3.13, which has no
+# PyTorch build before 2.9.0). Note: pip does not allow a wildcard version ("2.9.*")
+# together with a "+cpu" local version label, so this must be an exact "==" pin, not
+# a range. If Streamlit Cloud's Python version changes again and the build fails with
+# "Could not find a version that satisfies the requirement torch==2.9.1+cpu", open the
+# build log's ERROR line (it lists the versions actually available) and update the
+# line below to one of those, keeping the exact "==<version>+cpu" format.
 # =====================================================================================
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 # --- Web app framework -------------------------------------------------------------
 streamlit>=1.38,<2
 
-# --- Hugging Face model pipelines (image captioning + text generation) -------------
+# --- Hugging Face model pipelines (captioning + story generation + text-to-speech) -
 transformers>=4.44,<5
-torch==2.9.*+cpu
+torch==2.9.1+cpu
 sentencepiece>=0.2.0      # required tokenizer backend for the flan-t5 model
 accelerate>=0.34          # speeds up / simplifies model loading on CPU
 
 # --- Image handling ------------------------------------------------------------------
 Pillow>=10.4,<11
 
-# --- Text-to-Speech -------------------------------------------------------------------
-gTTS>=2.5,<3
+# --- Audio handling -------------------------------------------------------------------
+# The Hugging Face text-to-speech pipeline (facebook/mms-tts-eng) returns raw audio
+# samples as a numpy array, not an audio file — soundfile encodes those samples into
+# a WAV file in memory so Streamlit can play/download it.
+numpy>=1.24,<3
+soundfile>=0.12,<1
