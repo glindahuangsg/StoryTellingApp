@@ -9,7 +9,7 @@ import soundfile as sf
 from PIL import Image
 from transformers import (
     AutoProcessor,
-    AutoModelForVision2Seq,
+    AutoModelForMultimodalLM,
     AutoTokenizer,
     AutoModelForCausalLM,
     pipeline,
@@ -63,10 +63,10 @@ def load_vision_model():
         VISION_MODEL
     )
 
-    model = AutoModelForVision2Seq.from_pretrained(
-        VISION_MODEL,
-        torch_dtype=DTYPE,
-    )
+model = AutoModelForMultimodalLM.from_pretrained(
+    VISION_MODEL,
+    torch_dtype=DTYPE,
+)
 
     model.to(DEVICE)
 
