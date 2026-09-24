@@ -35,3 +35,9 @@ Pillow>=10.4,<11
 # a WAV file in memory so Streamlit can play/download it.
 numpy>=1.24,<3
 soundfile>=0.12,<1
+
+
+streamlit
+transformers<5.0.0
+Pillow
+torch
