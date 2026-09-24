@@ -17,9 +17,8 @@
                          child can pick "Quick Story" (50-100 words, meets the
                          assignment's word-count requirement) or "Big Adventure"
                          (~200-260 words, roughly a 1.5-2 minute read-aloud).
-   4. TEXT-TO-SPEECH  : A Hugging Face text-to-speech pipeline (microsoft/speecht5_tts
-                         + microsoft/speecht5_hifigan vocoder), steered towards a
-                         warm, gentle female voice preset, reads the story aloud.
+   4. TEXT-TO-SPEECH  : A Hugging Face text-to-speech pipeline (facebook/mms-tts-eng)
+                         reads the story aloud.
    5. STREAMLIT UI     : A bright, playful, icon-first interface designed so a child
                          who cannot read yet can still use every control.
 
@@ -38,9 +37,15 @@
      kids' app where speed keeps the child engaged.
    - A true "mom's voice" would require actual voice cloning (a recorded sample
      of her voice + a much larger cloning model), which conflicts with the
-     "make it faster" requirement and needs extra setup. Instead, this app steers
-     a Hugging Face TTS model to a specific pre-recorded warm/gentle female voice
-     embedding, the closest practical approximation without cloning.
+     "make it faster" requirement and needs extra setup. An earlier version of
+     this app instead steered microsoft/speecht5_tts to a specific warm, gentle
+     female voice embedding pulled from the Hugging Face `datasets` library —
+     that was reverted because `datasets` pulls in `dill` for cache
+     fingerprinting, and `dill` is incompatible with a pickle-internals change
+     in Python 3.14 (Streamlit Cloud's current runtime), crashing with
+     "TypeError: Pickler._batch_setitems() takes 2 positional arguments but 3
+     were given" on every run. facebook/mms-tts-eng has no such dependency and
+     its single built-in voice is itself calm and clear.
    - Errors from the ML pipelines are caught and shown as a friendly message
      while the technical detail is still surfaced with st.exception() for
      debugging.
@@ -52,10 +57,8 @@ import io
 import numpy as np
 import soundfile as sf
 import streamlit as st
-import torch
-from datasets import load_dataset
 from PIL import Image
-from transformers import SpeechT5HifiGan, pipeline
+from transformers import pipeline
 
 
 # -------------------------------------------------------------------------------------
@@ -80,14 +83,7 @@ CAPTION_MODEL_NAME = "Salesforce/blip-image-captioning-base"
 # which matters most on Streamlit Cloud's free CPU tier.
 STORY_MODEL_NAME = "google/flan-t5-small"
 
-TTS_MODEL_NAME = "microsoft/speecht5_tts"
-TTS_VOCODER_NAME = "microsoft/speecht5_hifigan"
-
-# Index into the "Matthijs/cmu-arctic-xvectors" speaker-embedding dataset. This
-# particular index is the warm, clear female voice used in Hugging Face's own
-# official SpeechT5 tutorial, and is the closest practical stand-in for a
-# "motherly" voice without doing full voice cloning from a real recording.
-MOM_VOICE_SPEAKER_INDEX = 7306
+TTS_MODEL_NAME = "facebook/mms-tts-eng"
 
 # Two story-length presets the child can pick between. "Quick Story" matches the
 # assignment's required 50-100 word range; "Big Adventure" is a longer, optional
@@ -224,47 +220,21 @@ def load_tts_model():
     """
     Load a pre-trained Hugging Face text-to-speech pipeline.
 
-    Model: microsoft/speecht5_tts, paired with the microsoft/speecht5_hifigan
-    vocoder (SpeechT5 outputs a mel-spectrogram, not raw audio, so it needs a
-    vocoder to turn that spectrogram into a waveform). Unlike a single-voice
-    model, SpeechT5 accepts a "speaker embedding" that steers its output
-    towards a specific voice character (see `load_speaker_embedding`), which
-    is what lets this app pick a warm, gentle voice instead of a generic one.
+    Model: facebook/mms-tts-eng (Meta's Massively Multilingual Speech TTS
+    model, English checkpoint). This is a single self-contained model call —
+    no separate vocoder object and no extra dataset download — which keeps
+    the deploy simple and reliable. (An earlier version of this app tried to
+    pick a specific warm/gentle voice via microsoft/speecht5_tts + a speaker
+    embedding pulled from the `datasets` library; that was reverted after it
+    crashed on Streamlit Cloud's Python 3.14 runtime due to a `dill`/pickle
+    incompatibility inside `datasets` unrelated to the model itself — not
+    worth the fragility for a voice nicety.)
 
     Returns:
         transformers.Pipeline: a "text-to-speech" pipeline ready to use.
     """
-    # NOTE: the pipeline's `vocoder=` argument needs an already-loaded model
-    # object, not a model-name string — passing a string silently fails later
-    # (the pipeline tries to read `.config` off the string and crashes), so
-    # the vocoder is loaded explicitly here first.
-    vocoder = SpeechT5HifiGan.from_pretrained(TTS_VOCODER_NAME)
-    tts = pipeline(task="text-to-speech", model=TTS_MODEL_NAME, vocoder=vocoder)
+    tts = pipeline(task="text-to-speech", model=TTS_MODEL_NAME)
     return tts
-
-
-@st.cache_resource(show_spinner=False)
-def load_speaker_embedding():
-    """
-    Load a pre-recorded "speaker embedding" — a numerical fingerprint of a
-    specific voice — used to steer SpeechT5 towards a warm, gentle female
-    voice, as the closest practical stand-in for a "mom's voice" reading the
-    story aloud.
-
-    This uses index MOM_VOICE_SPEAKER_INDEX from the "Matthijs/cmu-arctic-
-    xvectors" dataset on the Hugging Face Hub — the same speaker Hugging
-    Face's own official SpeechT5 tutorial uses. True voice cloning (matching
-    one specific real person's actual voice) would instead need a recording
-    of that person's voice and a much larger, slower cloning model, which
-    works against this app's "make it faster" requirement — see the README
-    for that trade-off.
-
-    Returns:
-        torch.Tensor: a speaker embedding tensor shaped for the TTS pipeline.
-    """
-    embeddings_dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation")
-    speaker_embedding = torch.tensor(embeddings_dataset[MOM_VOICE_SPEAKER_INDEX]["xvector"]).unsqueeze(0)
-    return speaker_embedding
 
 
 # -------------------------------------------------------------------------------------
@@ -374,11 +344,11 @@ def generate_story(caption: str, story_generator, min_words: int, max_words: int
     return story_text
 
 
-def text_to_speech(story_text: str, tts_pipeline, speaker_embedding) -> io.BytesIO:
+def text_to_speech(story_text: str, tts_pipeline) -> io.BytesIO:
     """
     Convert the generated story text into spoken audio using a Hugging Face
-    text-to-speech pipeline steered towards a warm, gentle voice, fulfilling
-    the assignment's Text-to-Speech Conversion requirement.
+    text-to-speech pipeline, fulfilling the assignment's Text-to-Speech
+    Conversion requirement.
 
     The pipeline returns raw audio samples (a numpy array) plus the sampling
     rate needed to play them back correctly — it does not hand back a ready
@@ -389,15 +359,11 @@ def text_to_speech(story_text: str, tts_pipeline, speaker_embedding) -> io.Bytes
     Args:
         story_text: the story to convert to speech.
         tts_pipeline: the Hugging Face text-to-speech pipeline (see load_tts_model).
-        speaker_embedding: the voice to use (see load_speaker_embedding).
 
     Returns:
         An in-memory WAV audio file (BytesIO), ready to play/download in Streamlit.
     """
-    speech_output = tts_pipeline(
-        story_text,
-        forward_params={"speaker_embeddings": speaker_embedding},
-    )
+    speech_output = tts_pipeline(story_text)
 
     # The pipeline returns a dict like {"audio": np.ndarray, "sampling_rate": int}.
     # "audio" can come back with an extra leading dimension; soundfile expects a
@@ -524,11 +490,10 @@ def run_storytelling_pipeline(image: Image.Image, min_words: int, max_words: int
             story_generator = load_story_model()
             story = generate_story(caption, story_generator, min_words, max_words)
 
-        # STEP 3: read the story aloud in a warm, gentle voice.
+        # STEP 3: read the story aloud.
         with st.spinner("🔊 Recording the story..."):
             tts_pipeline = load_tts_model()
-            speaker_embedding = load_speaker_embedding()
-            audio_buffer = text_to_speech(story, tts_pipeline, speaker_embedding)
+            audio_buffer = text_to_speech(story, tts_pipeline)
 
         # --- Display results ---
         st.balloons()  # a fun, wordless "ta-da!" moment for kids who can't read yet
