@@ -12,15 +12,16 @@
                          (Salesforce/blip-image-captioning-base) looks at the
                          picture and writes a short caption describing it,
                          e.g. "a dog playing with a red ball".
-   3. STORY GENERATION: A Hugging Face text-generation pipeline (google/flan-t5-base)
-                         expands that caption into a short, cheerful story
-                         (50-100 words) written for young children.
-   4. TEXT-TO-SPEECH  : A Hugging Face text-to-speech pipeline
-                         (facebook/mms-tts-eng) converts the story into spoken
-                         audio so kids can listen to it read aloud, as required
-                         by the assignment's Text-to-Speech Conversion criterion.
-   5. STREAMLIT UI     : All of the above is wired into an interactive, kid-friendly
-                         web page that can be deployed to Streamlit Cloud.
+   3. STORY GENERATION: A Hugging Face text-generation pipeline (google/flan-t5-small)
+                         expands that caption into a cheerful children's story. The
+                         child can pick "Quick Story" (50-100 words, meets the
+                         assignment's word-count requirement) or "Big Adventure"
+                         (~200-260 words, roughly a 1.5-2 minute read-aloud).
+   4. TEXT-TO-SPEECH  : A Hugging Face text-to-speech pipeline (microsoft/speecht5_tts
+                         + microsoft/speecht5_hifigan vocoder), steered towards a
+                         warm, gentle female voice preset, reads the story aloud.
+   5. STREAMLIT UI     : A bright, playful, icon-first interface designed so a child
+                         who cannot read yet can still use every control.
 
  DESIGN NOTES (for graders / code review)
    - Every stage of the pipeline — captioning, story writing, AND speech — uses a
@@ -29,13 +30,20 @@
    - Each pipeline stage lives in its own small function (single responsibility),
      satisfying the "use functions for modularity and readability" criterion.
    - Model objects are loaded with `st.cache_resource` so the (large) neural
-     network weights are downloaded/loaded only once per app session, not on
-     every button click — this keeps the app responsive.
-   - Every function has a docstring and inline comments explaining *why*, not
-     just *what*, consistent with the "code documentation" grading criterion.
+     network weights are downloaded/loaded only once per app session.
+   - `google/flan-t5-small` (not `-base`) is used deliberately for speed: it is
+     roughly 3x smaller, which matters a lot on Streamlit Cloud's CPU-only free
+     tier. The trade-off is slightly less polished prose than the larger `-base`
+     model, especially for the longer "Big Adventure" mode — acceptable for a
+     kids' app where speed keeps the child engaged.
+   - A true "mom's voice" would require actual voice cloning (a recorded sample
+     of her voice + a much larger cloning model), which conflicts with the
+     "make it faster" requirement and needs extra setup. Instead, this app steers
+     a Hugging Face TTS model to a specific pre-recorded warm/gentle female voice
+     embedding, the closest practical approximation without cloning.
    - Errors from the ML pipelines are caught and shown as a friendly message
-     (kids/parents are the target audience) while the technical detail is still
-     surfaced with st.exception() for debugging.
+     while the technical detail is still surfaced with st.exception() for
+     debugging.
 =====================================================================================
 """
 
@@ -44,6 +52,8 @@ import io
 import numpy as np
 import soundfile as sf
 import streamlit as st
+import torch
+from datasets import load_dataset
 from PIL import Image
 from transformers import pipeline
 
@@ -54,7 +64,7 @@ from transformers import pipeline
 # -------------------------------------------------------------------------------------
 st.set_page_config(
     page_title="Story Time!",
-    page_icon="📖",
+    page_icon="🧸",
     layout="centered",
 )
 
@@ -65,10 +75,105 @@ st.set_page_config(
 # easy to tune later without hunting through the code.
 # -------------------------------------------------------------------------------------
 CAPTION_MODEL_NAME = "Salesforce/blip-image-captioning-base"
-STORY_MODEL_NAME = "google/flan-t5-base"
-TTS_MODEL_NAME = "facebook/mms-tts-eng"
-MIN_STORY_WORDS = 50
-MAX_STORY_WORDS = 100
+
+# flan-t5-small (not -base) trades a little prose quality for a large speed gain,
+# which matters most on Streamlit Cloud's free CPU tier.
+STORY_MODEL_NAME = "google/flan-t5-small"
+
+TTS_MODEL_NAME = "microsoft/speecht5_tts"
+TTS_VOCODER_NAME = "microsoft/speecht5_hifigan"
+
+# Index into the "Matthijs/cmu-arctic-xvectors" speaker-embedding dataset. This
+# particular index is the warm, clear female voice used in Hugging Face's own
+# official SpeechT5 tutorial, and is the closest practical stand-in for a
+# "motherly" voice without doing full voice cloning from a real recording.
+MOM_VOICE_SPEAKER_INDEX = 7306
+
+# Two story-length presets the child can pick between. "Quick Story" matches the
+# assignment's required 50-100 word range; "Big Adventure" is a longer, optional
+# mode for a ~1.5-2 minute read-aloud story.
+STORY_LENGTH_PRESETS = {
+    "🐣 Quick Story  (~1 minute)": (50, 100),
+    "🐉 Big Adventure  (~2 minutes)": (200, 260),
+}
+
+
+# -------------------------------------------------------------------------------------
+# KID-FRIENDLY THEME
+# Injects custom CSS so the app looks colourful and playful, and so every button
+# is big enough and icon-led enough for a child who cannot read yet to use it.
+# Streamlit's internal CSS class names can shift between versions, so this
+# targets stable, semantic selectors (button, role="radiogroup", img, headings)
+# rather than Streamlit's auto-generated class names, to stay robust over time.
+# -------------------------------------------------------------------------------------
+def apply_kid_friendly_theme() -> None:
+    """Inject CSS for a bright, rounded, big-button, kid-friendly look."""
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Baloo+2:wght@500;700;800&display=swap');
+
+        html, body, [class*="css"] {
+            font-family: 'Baloo 2', sans-serif !important;
+            font-size: 18px;
+        }
+
+        /* Soft pastel rainbow background instead of plain white */
+        .stApp {
+            background: linear-gradient(160deg, #FFF6E5 0%, #FFE3EC 35%, #E6F4FF 70%, #EAFBEA 100%);
+        }
+
+        /* Big, bold, friendly title */
+        h1 {
+            text-align: center;
+            color: #FF6F91;
+            text-shadow: 2px 2px 0px #FFD166;
+        }
+
+        /* Chunky, rounded, high-contrast buttons big enough for little fingers */
+        .stButton > button, .stDownloadButton > button {
+            font-family: 'Baloo 2', sans-serif !important;
+            font-size: 1.5rem !important;
+            font-weight: 700 !important;
+            color: #FFFFFF !important;
+            background: linear-gradient(135deg, #FF9A76, #FF6F91) !important;
+            border: none !important;
+            border-radius: 30px !important;
+            padding: 0.8em 1em !important;
+            box-shadow: 0 6px 0 #D6486B !important;
+            width: 100%;
+            transition: transform 0.08s ease-in-out;
+        }
+        .stButton > button:hover, .stDownloadButton > button:hover {
+            transform: scale(1.02);
+        }
+        .stButton > button:active, .stDownloadButton > button:active {
+            box-shadow: 0 2px 0 #D6486B !important;
+            transform: translateY(4px);
+        }
+
+        /* Friendly rounded "pill" look for the radio-button choices */
+        div[role="radiogroup"] {
+            gap: 0.5rem;
+        }
+        div[role="radiogroup"] label {
+            font-size: 1.2rem !important;
+            background: #FFFFFFCC;
+            border-radius: 20px;
+            padding: 0.5em 1em;
+            border: 3px solid #FFD166;
+        }
+
+        /* Rounded, framed photo preview so it feels like a polaroid, not a raw file */
+        div[data-testid="stImage"] img {
+            border-radius: 20px;
+            border: 6px solid #FFFFFF;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # -------------------------------------------------------------------------------------
@@ -101,14 +206,11 @@ def load_story_model():
     Load a pre-trained Hugging Face text-generation pipeline used to expand a
     short image caption into a longer, child-friendly story.
 
-    Model: google/flan-t5-base. Flan-T5 is "instruction-tuned", meaning it is
+    Model: google/flan-t5-small. Flan-T5 is "instruction-tuned", meaning it is
     good at following a written instruction (see `build_story_prompt` below)
     rather than just blindly continuing text — this makes the story's tone,
-    audience, and length far easier to control, which matters when writing
-    content for 3-10 year olds. (A plain causal-LM story model, such as
-    distilgpt2 or genre-story-generator-v2, has no such controls and can
-    wander into content unsuitable for young children — which is why it was
-    not used here even though it appears in some course examples.)
+    audience, and length far easier to control. The "small" checkpoint (not
+    "base") is used specifically for speed on CPU-only deployment.
 
     Returns:
         transformers.Pipeline: a "text2text-generation" pipeline ready to use.
@@ -122,17 +224,42 @@ def load_tts_model():
     """
     Load a pre-trained Hugging Face text-to-speech pipeline.
 
-    Model: facebook/mms-tts-eng (Meta's Massively Multilingual Speech TTS
-    model, English checkpoint). Using a genuine Hugging Face TTS pipeline
-    here — rather than an external service like gTTS — keeps the entire
-    caption -> story -> audio pipeline built on Hugging Face models, which is
-    what this assignment is specifically assessing.
+    Model: microsoft/speecht5_tts, paired with the microsoft/speecht5_hifigan
+    vocoder (SpeechT5 outputs a mel-spectrogram, not raw audio, so it needs a
+    vocoder to turn that spectrogram into a waveform). Unlike a single-voice
+    model, SpeechT5 accepts a "speaker embedding" that steers its output
+    towards a specific voice character (see `load_speaker_embedding`), which
+    is what lets this app pick a warm, gentle voice instead of a generic one.
 
     Returns:
         transformers.Pipeline: a "text-to-speech" pipeline ready to use.
     """
-    tts = pipeline(task="text-to-speech", model=TTS_MODEL_NAME)
+    tts = pipeline(task="text-to-speech", model=TTS_MODEL_NAME, vocoder=TTS_VOCODER_NAME)
     return tts
+
+
+@st.cache_resource(show_spinner=False)
+def load_speaker_embedding():
+    """
+    Load a pre-recorded "speaker embedding" — a numerical fingerprint of a
+    specific voice — used to steer SpeechT5 towards a warm, gentle female
+    voice, as the closest practical stand-in for a "mom's voice" reading the
+    story aloud.
+
+    This uses index MOM_VOICE_SPEAKER_INDEX from the "Matthijs/cmu-arctic-
+    xvectors" dataset on the Hugging Face Hub — the same speaker Hugging
+    Face's own official SpeechT5 tutorial uses. True voice cloning (matching
+    one specific real person's actual voice) would instead need a recording
+    of that person's voice and a much larger, slower cloning model, which
+    works against this app's "make it faster" requirement — see the README
+    for that trade-off.
+
+    Returns:
+        torch.Tensor: a speaker embedding tensor shaped for the TTS pipeline.
+    """
+    embeddings_dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation")
+    speaker_embedding = torch.tensor(embeddings_dataset[MOM_VOICE_SPEAKER_INDEX]["xvector"]).unsqueeze(0)
+    return speaker_embedding
 
 
 # -------------------------------------------------------------------------------------
@@ -158,42 +285,45 @@ def generate_caption(image: Image.Image, captioner) -> str:
     return caption
 
 
-def build_story_prompt(caption: str) -> str:
+def build_story_prompt(caption: str, min_words: int, max_words: int) -> str:
     """
     Build the natural-language instruction fed to the story-generation model.
 
     Keeping the prompt construction in its own function makes it easy to
-    tune the story's tone, safety rules, or length requirement later without
-    touching any other part of the pipeline.
+    tune the story's tone or safety rules later without touching any other
+    part of the pipeline. The word-count range is a parameter (not hardcoded)
+    so the same function serves both the "Quick Story" and "Big Adventure"
+    length presets.
 
     Args:
         caption: the caption describing the uploaded image.
+        min_words: the minimum word count to ask the model for.
+        max_words: the maximum word count to ask the model for.
 
     Returns:
         The full instruction prompt string for the text-generation model.
     """
     prompt = (
-        "Write a fun, imaginative, and gentle short story for young children "
+        "Write a fun, imaginative, and gentle story for young children "
         "aged 3 to 10 years old. The story must be simple, cheerful, and easy "
         "to understand, with no scary or violent content. The story should be "
-        "between 50 and 100 words long. Base the story on this scene: "
-        f"'{caption}'. Give the main character a name and a happy ending."
+        f"between {min_words} and {max_words} words long. Base the story on this "
+        f"scene: '{caption}'. Give the main character a name and a happy ending."
     )
     return prompt
 
 
-def generate_story(caption: str, story_generator,
-                    min_words: int = MIN_STORY_WORDS,
-                    max_words: int = MAX_STORY_WORDS) -> str:
+def generate_story(caption: str, story_generator, min_words: int, max_words: int) -> str:
     """
-    Turn an image caption into a short, child-friendly story of roughly
-    50-100 words, as required by the assignment brief.
+    Turn an image caption into a child-friendly story within [min_words, max_words].
 
     Language models don't guarantee an exact word count, so this function
     asks the model to generate text and retries a few times if the result
     comes back shorter than `min_words`. If the result is longer than
     `max_words`, it is trimmed down to the nearest full sentence so the
-    story never ends mid-sentence.
+    story never ends mid-sentence. The token budget passed to the model
+    scales with the requested word range, so the same function works for
+    both the short "Quick Story" and the longer "Big Adventure" preset.
 
     Args:
         caption: the caption describing the uploaded image.
@@ -204,15 +334,20 @@ def generate_story(caption: str, story_generator,
     Returns:
         The generated story text, constrained to roughly [min_words, max_words].
     """
-    prompt = build_story_prompt(caption)
+    prompt = build_story_prompt(caption, min_words, max_words)
     story_text = ""
     max_attempts = 3  # avoid retrying forever if the model keeps returning short text
+
+    # Scale the model's token budget to the requested word range. Roughly 1.3-1.8
+    # tokens per word covers typical English subword tokenization with headroom.
+    max_new_tokens = min(int(max_words * 1.8), 480)
+    min_new_tokens = max(int(min_words * 1.3), 16)
 
     for _ in range(max_attempts):
         output = story_generator(
             prompt,
-            max_new_tokens=180,
-            min_new_tokens=60,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
             do_sample=True,     # sampling (rather than greedy decoding) gives more
             temperature=0.9,    # varied, "storybook" language instead of flat text
             top_p=0.95,
@@ -234,11 +369,11 @@ def generate_story(caption: str, story_generator,
     return story_text
 
 
-def text_to_speech(story_text: str, tts_pipeline) -> io.BytesIO:
+def text_to_speech(story_text: str, tts_pipeline, speaker_embedding) -> io.BytesIO:
     """
     Convert the generated story text into spoken audio using a Hugging Face
-    text-to-speech pipeline, fulfilling the assignment's Text-to-Speech
-    Conversion requirement.
+    text-to-speech pipeline steered towards a warm, gentle voice, fulfilling
+    the assignment's Text-to-Speech Conversion requirement.
 
     The pipeline returns raw audio samples (a numpy array) plus the sampling
     rate needed to play them back correctly — it does not hand back a ready
@@ -249,15 +384,19 @@ def text_to_speech(story_text: str, tts_pipeline) -> io.BytesIO:
     Args:
         story_text: the story to convert to speech.
         tts_pipeline: the Hugging Face text-to-speech pipeline (see load_tts_model).
+        speaker_embedding: the voice to use (see load_speaker_embedding).
 
     Returns:
         An in-memory WAV audio file (BytesIO), ready to play/download in Streamlit.
     """
-    speech_output = tts_pipeline(story_text)
+    speech_output = tts_pipeline(
+        story_text,
+        forward_params={"speaker_embeddings": speaker_embedding},
+    )
 
     # The pipeline returns a dict like {"audio": np.ndarray, "sampling_rate": int}.
-    # "audio" commonly comes back with shape (1, num_samples); soundfile expects
-    # a flat 1-D array of samples, so we squeeze out that extra dimension.
+    # "audio" can come back with an extra leading dimension; soundfile expects a
+    # flat 1-D array of samples, so we squeeze out any singleton dimensions.
     audio_array = np.squeeze(np.asarray(speech_output["audio"]))
     sample_rate = speech_output["sampling_rate"]
 
@@ -271,14 +410,18 @@ def text_to_speech(story_text: str, tts_pipeline) -> io.BytesIO:
 # -------------------------------------------------------------------------------------
 # STREAMLIT USER INTERFACE
 # Kept separate from the ML logic above so the UI layer and the pipeline
-# logic can each be read (and modified) independently.
+# logic can each be read (and modified) independently. Labels lean on big
+# icons/emoji first and short words second, since the target user may not
+# be able to read yet.
 # -------------------------------------------------------------------------------------
 def render_header() -> None:
     """Display the app's title and a short, friendly instruction for kids/parents."""
-    st.title("📖✨ Story Time! ✨📖")
+    st.title("🧸✨ Story Time! ✨🧸")
     st.markdown(
-        "**Take or upload a picture and watch it turn into a magical story "
-        "you can listen to!**"
+        "<p style='text-align:center; font-size:1.3rem;'>"
+        "📸 ➜ 📖 ➜ 🎧 &nbsp; Turn a picture into a story you can listen to!"
+        "</p>",
+        unsafe_allow_html=True,
     )
     st.markdown("---")
 
@@ -288,27 +431,40 @@ def get_user_image():
     Let the user provide a picture either by uploading a file or by taking a
     photo with their device's camera, and return it as a PIL image.
 
-    Offering both input methods (rather than only one) makes the app easier
-    to use across devices — a child on a tablet/phone can snap a photo
-    directly, while a parent on a laptop can upload an existing picture.
+    Offering both input methods makes the app easier to use across devices —
+    a child on a tablet/phone can snap a photo directly, while a parent on a
+    laptop can upload an existing picture. A session-state counter is used
+    as part of each widget's key so `reset_for_new_story()` can force fresh,
+    empty upload/camera widgets when the child wants to make another story.
 
     Returns:
         A PIL.Image.Image in RGB mode, or None if no picture has been
         provided yet.
     """
+    if "uploader_generation" not in st.session_state:
+        st.session_state.uploader_generation = 0
+    generation = st.session_state.uploader_generation
+
     input_mode = st.radio(
-        "How would you like to add a picture?",
-        options=["📁 Upload a photo", "📷 Take a photo"],
+        "How do you want to add a picture?",
+        options=["📁 Upload a Photo", "🤳 Take a Photo"],
         horizontal=True,
+        label_visibility="collapsed",
     )
 
-    if input_mode == "📁 Upload a photo":
+    if input_mode == "📁 Upload a Photo":
         uploaded_file = st.file_uploader(
-            "Choose a picture to bring to life:",
+            "Choose a picture:",
             type=["png", "jpg", "jpeg"],
+            key=f"uploader_{generation}",
+            label_visibility="collapsed",
         )
     else:
-        uploaded_file = st.camera_input("Take a picture to bring to life:")
+        uploaded_file = st.camera_input(
+            "Take a picture:",
+            key=f"camera_{generation}",
+            label_visibility="collapsed",
+        )
 
     if uploaded_file is None:
         return None
@@ -319,13 +475,38 @@ def get_user_image():
     return image
 
 
-def run_storytelling_pipeline(image: Image.Image) -> None:
+def get_story_length_choice() -> tuple:
+    """
+    Let the child (or a parent helping them) pick how long the story should
+    be, using big icon-led buttons rather than a plain word-count input.
+
+    Returns:
+        A (min_words, max_words) tuple for the chosen preset.
+    """
+    length_label = st.radio(
+        "How long should the story be?",
+        options=list(STORY_LENGTH_PRESETS.keys()),
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    return STORY_LENGTH_PRESETS[length_label]
+
+
+def reset_for_new_story() -> None:
+    """Clear the current picture so the child can start a fresh story."""
+    st.session_state.uploader_generation = st.session_state.get("uploader_generation", 0) + 1
+    st.rerun()
+
+
+def run_storytelling_pipeline(image: Image.Image, min_words: int, max_words: int) -> None:
     """
     Run the full caption -> story -> audio pipeline for a given image and
     render the results in the Streamlit UI.
 
     Args:
         image: the PIL image to turn into a story.
+        min_words: minimum requested story length in words.
+        max_words: maximum requested story length in words.
     """
     try:
         # STEP 1: describe what is in the picture.
@@ -333,31 +514,36 @@ def run_storytelling_pipeline(image: Image.Image) -> None:
             captioner = load_caption_model()
             caption = generate_caption(image, captioner)
 
-        # STEP 2: turn that description into a short story for kids.
+        # STEP 2: turn that description into a story for kids.
         with st.spinner("✍️ Writing your story..."):
             story_generator = load_story_model()
-            story = generate_story(caption, story_generator)
+            story = generate_story(caption, story_generator, min_words, max_words)
 
-        # STEP 3: read the story aloud.
+        # STEP 3: read the story aloud in a warm, gentle voice.
         with st.spinner("🔊 Recording the story..."):
             tts_pipeline = load_tts_model()
-            audio_buffer = text_to_speech(story, tts_pipeline)
+            speaker_embedding = load_speaker_embedding()
+            audio_buffer = text_to_speech(story, tts_pipeline, speaker_embedding)
 
         # --- Display results ---
+        st.balloons()  # a fun, wordless "ta-da!" moment for kids who can't read yet
+
         st.markdown("### 📝 Your Story")
         st.write(story)
 
         word_count = len(story.split())
-        st.caption(f"Word count: {word_count} words")
+        st.caption(f"Word count: {word_count} words")  # for parents/grading reference
 
-        st.markdown("### 🎧 Listen to Your Story")
-        st.audio(audio_buffer, format="audio/wav")
+        st.markdown("### 🎧 Listen!")
+        # autoplay=True starts the story reading itself as soon as it's ready —
+        # important for a child who can't yet read "press play".
+        st.audio(audio_buffer, format="audio/wav", autoplay=True)
 
         # Give the download button a fresh copy of the buffer, since st.audio()
         # may already have consumed/read from the original position.
         audio_buffer.seek(0)
         st.download_button(
-            label="⬇️ Download Story Audio",
+            label="⬇️ 🎵 Save the Story",
             data=audio_buffer,
             file_name="my_story.wav",
             mime="audio/wav",
@@ -367,6 +553,10 @@ def run_storytelling_pipeline(image: Image.Image) -> None:
         # the image-captioning step genuinely ran.
         with st.expander("🔍 See what the AI noticed in your picture"):
             st.write(f"Image caption: *{caption}*")
+
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        if st.button("🔁 Make Another Story!"):
+            reset_for_new_story()
 
     except Exception as error:
         # Friendly, non-technical message for the app's young audience/parents.
@@ -383,19 +573,25 @@ def main() -> None:
     Main entry point of the Streamlit app. Wires together the UI and the
     caption -> story -> audio pipeline described at the top of this file.
     """
+    apply_kid_friendly_theme()
     render_header()
+
     image = get_user_image()
 
     if image is None:
         st.info("👆 Add a picture above to get started!")
         return
 
-    # Show the picture to the user right away, before any AI runs.
-    st.image(image, caption="Your picture", use_container_width=True)
+    # Show the picture small and centered, not stretched across the whole page.
+    left, middle, right = st.columns([1, 2, 1])
+    with middle:
+        st.image(image, caption="Your picture", width=260)
+
+    min_words, max_words = get_story_length_choice()
 
     # A single button triggers the whole pipeline, so kids only need one click.
-    if st.button("✨ Create My Story! ✨"):
-        run_storytelling_pipeline(image)
+    if st.button("✨ Make My Story! ✨"):
+        run_storytelling_pipeline(image, min_words, max_words)
 
 
 if __name__ == "__main__":
