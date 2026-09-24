@@ -55,7 +55,7 @@ import streamlit as st
 import torch
 from datasets import load_dataset
 from PIL import Image
-from transformers import pipeline
+from transformers import SpeechT5HifiGan, pipeline
 
 
 # -------------------------------------------------------------------------------------
@@ -234,7 +234,12 @@ def load_tts_model():
     Returns:
         transformers.Pipeline: a "text-to-speech" pipeline ready to use.
     """
-    tts = pipeline(task="text-to-speech", model=TTS_MODEL_NAME, vocoder=TTS_VOCODER_NAME)
+    # NOTE: the pipeline's `vocoder=` argument needs an already-loaded model
+    # object, not a model-name string — passing a string silently fails later
+    # (the pipeline tries to read `.config` off the string and crashes), so
+    # the vocoder is loaded explicitly here first.
+    vocoder = SpeechT5HifiGan.from_pretrained(TTS_VOCODER_NAME)
+    tts = pipeline(task="text-to-speech", model=TTS_MODEL_NAME, vocoder=vocoder)
     return tts
 
 
