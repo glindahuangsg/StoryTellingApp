@@ -1,0 +1,19 @@
+# =====================================================================================
+# requirements.txt — Python dependencies for "Story Time!"
+# Pinned to versions known to work together on Streamlit Cloud (Python 3.11 runtime).
+# =====================================================================================
+
+# --- Web app framework -------------------------------------------------------------
+streamlit==1.38.0
+
+# --- Hugging Face model pipelines (image captioning + text generation) -------------
+transformers==4.44.2
+torch==2.4.1
+sentencepiece==0.2.0      # required tokenizer backend for the flan-t5 model
+accelerate==0.34.2        # speeds up / simplifies model loading on CPU
+
+# --- Image handling ------------------------------------------------------------------
+Pillow==10.4.0
+
+# --- Text-to-Speech -------------------------------------------------------------------
+gTTS==2.5.3
