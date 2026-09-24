@@ -1,60 +1,27 @@
 import gc
-import io
 import re
-import zipfile
 
-import numpy as np
-import soundfile as sf
 import streamlit as st
 import torch
 
 from PIL import Image
-
 from transformers import (
     AutoProcessor,
-    AutoModelForImageTextToText,
-    SpeechT5Processor,
-    SpeechT5ForTextToSpeech,
-    SpeechT5HifiGan,
+    AutoModelForMultimodalLM,
 )
-
-from huggingface_hub import hf_hub_download
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-# One vision-language model does both:
-#
-#   IMAGE -> UNDERSTANDING -> STORY
-#
-# This removes the additional SmolLM2 model and reduces
-# memory usage on Streamlit Cloud.
-VISION_MODEL = "HuggingFaceTB/SmolVLM-500M-Instruct"
+MODEL_NAME = "HuggingFaceTB/SmolVLM-500M-Instruct"
 
-# Text-to-speech
-TTS_MODEL = "microsoft/speecht5_tts"
-TTS_VOCODER = "microsoft/speecht5_hifigan"
-
-# Speaker embedding
-SPEAKER_REPO = "Matthijs/cmu-arctic-xvectors"
-SPEAKER_INDEX = 7306
-
-SAMPLE_RATE = 16000
+MAX_IMAGE_SIZE = 1024
 
 
 # ============================================================
-# DEVICE
-# ============================================================
-
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
-
-
-# ============================================================
-# STREAMLIT
+# STREAMLIT PAGE
 # ============================================================
 
 st.set_page_config(
@@ -62,6 +29,13 @@ st.set_page_config(
     page_icon="🌈",
     layout="centered",
 )
+
+
+# ============================================================
+# DEVICE
+# ============================================================
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # ============================================================
@@ -74,37 +48,35 @@ def add_css():
         """
         <style>
 
-        .title {
+        .main-title {
             text-align: center;
-            color: #6C63FF;
             font-size: 42px;
             font-weight: 800;
+            color: #6C63FF;
             margin-bottom: 5px;
         }
 
         .subtitle {
             text-align: center;
-            color: #666;
             font-size: 19px;
+            color: #666666;
             margin-bottom: 25px;
         }
 
         .story-box {
-            background: #FFF8E7;
-            border: 2px solid #FFE29A;
+            background-color: #FFF8E7;
+            border: 2px solid #FFD86B;
             border-radius: 20px;
             padding: 25px;
             font-size: 20px;
             line-height: 1.8;
-            margin-top: 15px;
-            margin-bottom: 20px;
         }
 
-        .hint-box {
-            background: #F2F7FF;
+        .tip-box {
+            background-color: #F1F7FF;
             border-radius: 18px;
             padding: 20px;
-            margin-top: 20px;
+            margin-top: 15px;
         }
 
         </style>
@@ -114,76 +86,19 @@ def add_css():
 
 
 # ============================================================
-# MEMORY CLEANUP
+# MODEL
 # ============================================================
 
-def cleanup_memory():
-
-    gc.collect()
-
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-# ============================================================
-# AGE SETTINGS
-# ============================================================
-
-def get_age_settings(age_group):
-
-    if age_group == "3–5":
-
-        return {
-            "sentences": 4,
-            "max_new_tokens": 180,
-            "language": (
-                "Use very simple words and short sentences."
-            ),
-            "tone": (
-                "gentle, cheerful, playful and reassuring"
-            ),
-        }
-
-    if age_group == "6–7":
-
-        return {
-            "sentences": 6,
-            "max_new_tokens": 240,
-            "language": (
-                "Use simple children's vocabulary and "
-                "clear sentences."
-            ),
-            "tone": (
-                "playful, curious, warm and imaginative"
-            ),
-        }
-
-    return {
-        "sentences": 8,
-        "max_new_tokens": 320,
-        "language": (
-            "Use easy-to-understand vocabulary suitable "
-            "for children aged 8 to 10."
-        ),
-        "tone": (
-            "imaginative, funny, adventurous and warm"
-        ),
-    }
-
-
-# ============================================================
-# VISION-LANGUAGE MODEL
-# ============================================================
-
-@st.cache_resource
-def load_vision_model():
+@st.cache_resource(show_spinner=False)
+def load_model():
 
     processor = AutoProcessor.from_pretrained(
-        VISION_MODEL
+        MODEL_NAME
     )
 
-    model = AutoModelForImageTextToText.from_pretrained(
-        VISION_MODEL
+    model = AutoModelForMultimodalLM.from_pretrained(
+        MODEL_NAME,
+        torch_dtype=torch.float32,
     )
 
     model.to(DEVICE)
@@ -193,175 +108,48 @@ def load_vision_model():
 
 
 # ============================================================
-# IMAGE DESCRIPTION
+# IMAGE PREPARATION
 # ============================================================
 
-def analyze_image(image):
+def prepare_image(image):
 
-    processor, model = load_vision_model()
+    image = image.convert("RGB")
 
-    prompt = """
-Look very carefully at this picture.
+    width, height = image.size
 
-You are preparing a children's story based ONLY on what
-can actually be seen in the picture.
-
-Describe the important visual facts.
-
-Include:
-
-1. MAIN SUBJECTS
-   - people
-   - children
-   - animals
-   - toys
-   - other important subjects
-
-2. IMPORTANT OBJECTS
-   - books
-   - balls
-   - bicycles
-   - food
-   - furniture
-   - vehicles
-   - toys
-   - etc.
-
-3. SETTING
-   - indoors or outdoors
-   - room, garden, park, beach, school, etc.
-   - only say something if it is reasonably visible
-
-4. COLORS
-   - important colors
-
-5. ACTIONS
-   - what the visible subjects appear to be doing
-
-6. VISUAL DETAILS
-   - clothing
-   - size
-   - shapes
-   - interesting details
-
-IMPORTANT:
-
-- Only describe things that are visible.
-- Do not invent people.
-- Do not invent animals.
-- Do not invent objects.
-- Do not invent a location that cannot reasonably be inferred.
-- Do not guess people's names.
-- Do not guess private information.
-- Do not guess thoughts or feelings as facts.
-- If something is unclear, say "unclear".
-- Do NOT write a story yet.
-"""
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                },
-                {
-                    "type": "text",
-                    "text": prompt,
-                },
-            ],
-        }
-    ]
-
-    text_prompt = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
+    largest_side = max(
+        width,
+        height,
     )
 
-    inputs = processor(
-        text=text_prompt,
-        images=[image],
-        return_tensors="pt",
-    )
+    if largest_side > MAX_IMAGE_SIZE:
 
-    inputs = {
-        key: value.to(DEVICE)
-        for key, value in inputs.items()
-    }
-
-    with torch.no_grad():
-
-        output = model.generate(
-            **inputs,
-            max_new_tokens=300,
-            do_sample=False,
+        scale = (
+            MAX_IMAGE_SIZE
+            / largest_side
         )
 
-    input_length = inputs[
-        "input_ids"
-    ].shape[-1]
+        new_width = int(
+            width * scale
+        )
 
-    generated = output[
-        0,
-        input_length:
-    ]
+        new_height = int(
+            height * scale
+        )
 
-    description = processor.decode(
-        generated,
-        skip_special_tokens=True,
-    )
+        image = image.resize(
+            (
+                new_width,
+                new_height,
+            ),
+            Image.Resampling.LANCZOS,
+        )
 
-    cleanup_memory()
-
-    return description.strip()
-
-
-# ============================================================
-# STORY SAFETY
-# ============================================================
-
-def contains_unsafe_content(text):
-
-    text_lower = text.lower()
-
-    unsafe_patterns = [
-        r"\bgun\b",
-        r"\bguns\b",
-        r"\bweapon\b",
-        r"\bweapons\b",
-        r"\bshoot\b",
-        r"\bshooting\b",
-        r"\bmurder\b",
-        r"\bkill\b",
-        r"\bkilled\b",
-        r"\bblood\b",
-        r"\bdead body\b",
-        r"\bsuicide\b",
-        r"\bdrug\b",
-        r"\bdrugs\b",
-        r"\bcocaine\b",
-        r"\bknife\b",
-        r"\bknives\b",
-        r"\bbomb\b",
-        r"\bterrorist\b",
-        r"\bporn\b",
-        r"\bsexual\b",
-    ]
-
-    for pattern in unsafe_patterns:
-
-        if re.search(
-            pattern,
-            text_lower,
-        ):
-
-            return True
-
-    return False
+    return image
 
 
 # ============================================================
-# SENTENCE FUNCTIONS
+# SENTENCE HANDLING
 # ============================================================
 
 def split_sentences(text):
@@ -375,189 +163,236 @@ def split_sentences(text):
     if not text:
         return []
 
-    sentences = re.split(
+    parts = re.split(
         r"(?<=[.!?])\s+",
         text,
     )
 
     return [
-        sentence.strip()
-        for sentence in sentences
-        if sentence.strip()
+        p.strip()
+        for p in parts
+        if p.strip()
     ]
 
 
-def normalize_sentence(text):
+def clean_story(text):
 
-    text = text.lower()
+    # Remove common unwanted prefixes.
 
     text = re.sub(
-        r"[^a-z0-9\s]",
+        r"^\s*(story|answer)\s*:\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    text = re.sub(
+        r"^\s*here is.*?:\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove markdown headings.
+
+    text = re.sub(
+        r"^#+\s*.*?\n",
         "",
         text,
     )
 
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
+    sentences = split_sentences(
+        text
     )
 
-    return text.strip()
+    # Remove exact duplicate sentences.
 
-
-def remove_duplicate_sentences(
-    sentences
-):
-
-    result = []
     seen = set()
+    clean = []
 
     for sentence in sentences:
 
-        normalized = normalize_sentence(
+        key = re.sub(
+            r"[^a-z0-9 ]",
+            "",
+            sentence.lower(),
+        )
+
+        key = re.sub(
+            r"\s+",
+            " ",
+            key,
+        ).strip()
+
+        if not key:
+            continue
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        clean.append(
             sentence
         )
 
-        if not normalized:
-            continue
-
-        if normalized in seen:
-            continue
-
-        seen.add(normalized)
-        result.append(sentence)
-
-    return result
+    return clean
 
 
 # ============================================================
-# STORY GENERATION
+# AGE SETTINGS
 # ============================================================
 
-def generate_story(
-    image,
-    visual_description,
+def get_age_settings(age_group):
+
+    if age_group == "3–5":
+
+        return {
+            "sentence_count": 5,
+            "tokens": 180,
+            "language": (
+                "Use very simple words and short sentences."
+            ),
+        }
+
+    if age_group == "6–7":
+
+        return {
+            "sentence_count": 7,
+            "tokens": 230,
+            "language": (
+                "Use simple vocabulary and short, "
+                "easy-to-follow sentences."
+            ),
+        }
+
+    return {
+        "sentence_count": 9,
+        "tokens": 300,
+        "language": (
+            "Use vocabulary suitable for children "
+            "aged 8 to 10."
+        ),
+    }
+
+
+# ============================================================
+# STORY PROMPT
+# ============================================================
+
+def make_prompt(
     age_group,
     story_style,
 ):
-
-    processor, model = load_vision_model()
 
     settings = get_age_settings(
         age_group
     )
 
-    prompt = f"""
-You are a kind and imaginative children's storyteller.
+    return f"""
+You are a friendly children's storyteller.
 
-Look at the picture and the visual notes below.
+Look carefully at the picture.
 
-VISUAL NOTES:
-{visual_description}
+Write a COMPLETE children's story based on what you
+can actually see in the picture.
 
-Now write a complete story inspired by THIS PICTURE.
+The child is {age_group} years old.
 
-CHILD'S AGE:
-{age_group}
-
-STORY STYLE:
+Story style:
 {story_style}
 
-LENGTH:
-Write exactly {settings["sentences"]} complete sentences.
-
-LANGUAGE:
 {settings["language"]}
 
-TONE:
-The story should be {settings["tone"]}.
+IMPORTANT:
+The story MUST be connected to the picture.
 
-==================================================
-MOST IMPORTANT RULE: STAY CONNECTED TO THE PICTURE
-==================================================
+Use several visible details from the picture.
 
-The story must clearly describe and use things that are
-actually visible in the picture.
+For example, if you can see:
+- a child, include the child;
+- a dog, include the dog;
+- books, include the books;
+- a ball, include the ball;
+- a bicycle, include the bicycle;
+- a garden, use the garden;
+- particular colors, you may mention them.
 
-Use several concrete visual details, such as:
+Do not invent a completely different scene.
 
-- the main person or child
-- an animal
-- an important object
-- a toy
-- a book
-- a ball
-- a bicycle
-- a visible color
-- the visible setting
-- a visible action
-
-The story should feel as though the adventure begins
-INSIDE THIS PICTURE.
-
-You may use gentle imagination.
+You may add gentle imagination to visible objects.
 
 For example:
+A visible book can become a magical book.
+A visible dog can become an adventure friend.
+A visible ball can lead to a playful adventure.
 
-If there is a red ball, the ball can become magical.
+But the story must still clearly relate to the picture.
 
-If there is a dog, the dog can become the child's
-adventure companion.
+SAFETY:
+This story is for children.
 
-If there are books, the books can lead to an imaginary
-adventure.
-
-If there is a garden, the garden can become an enchanted
-garden.
-
-But do NOT replace the picture with a completely
-unrelated story.
-
-==================================================
-CHILD SAFETY
-==================================================
-
-The story must be suitable for children aged {age_group}.
-
-Do NOT include:
-
+Do not include:
 - violence
-- weapons
 - fighting
+- weapons
 - blood
 - death
 - murder
-- frightening horror
-- dangerous instructions
+- horror
+- frightening scenes
 - drugs
-- adult themes
 - sexual content
 - hateful content
-- cruelty
 - self-harm
+- dangerous instructions
 
-Keep the adventure safe and reassuring.
+Make the story warm, playful and reassuring.
 
-==================================================
-WRITING RULES
-==================================================
+WRITING REQUIREMENTS:
 
-- Write exactly {settings["sentences"]} sentences.
-- Every sentence must be complete.
-- Do not repeat a sentence.
-- Do not repeat the same event.
-- Do not use a title.
-- Do not use bullet points.
-- Do not say "Story:".
-- Do not mention AI.
-- Do not explain what you are doing.
-- Do not leave the story unfinished.
-- The final sentence must provide a satisfying, happy ending.
-- Output ONLY the story.
+Write exactly {settings["sentence_count"]} complete sentences.
 
-Begin the story now.
+Every sentence must be complete.
+
+Do not repeat sentences.
+
+Do not repeat the same event.
+
+Do not create a title.
+
+Do not use bullet points.
+
+Do not explain your answer.
+
+Do not say "Here is your story".
+
+Do not mention AI.
+
+The final sentence must provide a happy and complete ending.
+
+OUTPUT ONLY THE STORY.
+
+Start now.
 """
+
+
+# ============================================================
+# GENERATE STORY
+# ============================================================
+
+def generate_story(
+    image,
+    age_group,
+    story_style,
+):
+
+    processor, model = load_model()
+
+    prompt = make_prompt(
+        age_group,
+        story_style,
+    )
 
     messages = [
         {
@@ -574,107 +409,148 @@ Begin the story now.
         }
     ]
 
-    text_prompt = processor.apply_chat_template(
+    # --------------------------------------------------------
+    # Let the processor create the complete multimodal input.
+    # This follows the current SmolVLM usage pattern.
+    # --------------------------------------------------------
+
+    inputs = processor.apply_chat_template(
         messages,
         add_generation_prompt=True,
-    )
-
-    inputs = processor(
-        text=text_prompt,
-        images=[image],
+        tokenize=True,
+        return_dict=True,
         return_tensors="pt",
     )
 
-    inputs = {
-        key: value.to(DEVICE)
-        for key, value in inputs.items()
-    }
+    inputs = inputs.to(
+        DEVICE
+    )
 
-    with torch.no_grad():
+    # --------------------------------------------------------
+    # Generate
+    # --------------------------------------------------------
+
+    with torch.inference_mode():
 
         output = model.generate(
             **inputs,
-
-            max_new_tokens=settings[
-                "max_new_tokens"
-            ],
-
+            max_new_tokens=get_age_settings(
+                age_group
+            )["tokens"],
             do_sample=True,
-
-            temperature=0.65,
-
-            top_p=0.90,
-
+            temperature=0.7,
+            top_p=0.9,
             repetition_penalty=1.15,
-
             no_repeat_ngram_size=4,
-
-            eos_token_id=(
-                processor.tokenizer.eos_token_id
-                if hasattr(
-                    processor,
-                    "tokenizer",
-                )
-                else None
-            ),
         )
 
-    input_length = inputs[
-        "input_ids"
-    ].shape[-1]
+    # --------------------------------------------------------
+    # Remove prompt tokens.
+    # --------------------------------------------------------
 
-    generated = output[
+    input_length = (
+        inputs["input_ids"].shape[-1]
+    )
+
+    generated_tokens = output[
         0,
         input_length:
     ]
 
     story = processor.decode(
-        generated,
+        generated_tokens,
         skip_special_tokens=True,
-    ).strip()
-
-    # --------------------------------------------------------
-    # Remove accidental prefixes.
-    # --------------------------------------------------------
-
-    story = re.sub(
-        r"^(Story:|story:)\s*",
-        "",
-        story,
     )
 
-    story = re.sub(
-        r"^Here is.*?:\s*",
-        "",
-        story,
-        flags=re.IGNORECASE,
-    )
-
-    # --------------------------------------------------------
-    # Split and remove duplicates.
-    # --------------------------------------------------------
-
-    sentences = split_sentences(
+    story = clean_story(
         story
     )
 
-    sentences = remove_duplicate_sentences(
-        sentences
+    settings = get_age_settings(
+        age_group
     )
 
-    # Keep only complete requested sentences.
+    # --------------------------------------------------------
+    # Keep the requested number of sentences.
+    # --------------------------------------------------------
 
-    sentences = sentences[
-        :settings["sentences"]
+    story = story[
+        :settings["sentence_count"]
     ]
 
-    story = " ".join(
-        sentences
+    # --------------------------------------------------------
+    # Join the final story.
+    # --------------------------------------------------------
+
+    final_story = " ".join(
+        story
     ).strip()
 
-    cleanup_memory()
+    # --------------------------------------------------------
+    # Cleanup temporary tensors.
+    # --------------------------------------------------------
 
-    return story
+    del inputs
+    del output
+
+    gc.collect()
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return final_story
+
+
+# ============================================================
+# FALLBACK
+# ============================================================
+
+def fallback_story(age_group):
+
+    if age_group == "3–5":
+
+        return (
+            "The picture was the beginning of a "
+            "wonderful little adventure. "
+            "Everyone looked around and noticed "
+            "the interesting things nearby. "
+            "They explored together with big smiles. "
+            "Soon they discovered something fun. "
+            "Everyone went home feeling happy."
+        )
+
+    if age_group == "6–7":
+
+        return (
+            "The picture looked like the beginning "
+            "of a wonderful adventure. "
+            "The characters noticed something "
+            "interesting nearby. "
+            "They decided to explore together. "
+            "Their little adventure became more "
+            "exciting with every step. "
+            "They laughed and shared ideas. "
+            "Soon they discovered a lovely surprise. "
+            "Everyone enjoyed the adventure. "
+            "At the end, they went home with happy memories."
+        )
+
+    return (
+        "The picture looked like the beginning "
+        "of an unexpected adventure. "
+        "The characters noticed several interesting "
+        "details around them. "
+        "They decided to explore the scene together. "
+        "As they looked around, their imagination "
+        "turned the ordinary moment into something special. "
+        "They followed their curiosity and discovered "
+        "a delightful surprise. "
+        "Everyone shared the moment with smiles and laughter. "
+        "The adventure gave them a wonderful memory "
+        "to talk about later. "
+        "By the end of the day, everyone felt happy "
+        "about the adventure they had shared."
+    )
 
 
 # ============================================================
@@ -683,581 +559,44 @@ Begin the story now.
 
 def validate_story(
     story,
-    visual_description,
     age_group,
 ):
 
     if not story:
         return False
 
-    if contains_unsafe_content(
+    sentences = clean_story(
         story
-    ):
-        return False
+    )
 
-    settings = get_age_settings(
+    required = get_age_settings(
         age_group
-    )
+    )["sentence_count"]
 
-    sentences = split_sentences(
-        story
-    )
+    # We require the complete requested story.
 
-    sentences = remove_duplicate_sentences(
-        sentences
-    )
-
-    # --------------------------------------------------------
-    # Must contain enough complete sentences.
-    # --------------------------------------------------------
-
-    if len(sentences) < settings[
-        "sentences"
-    ]:
+    if len(sentences) < required:
 
         return False
 
-    # --------------------------------------------------------
-    # Check that the story is actually grounded in the image.
-    #
-    # Look for concrete words shared between the visual
-    # description and story.
-    # --------------------------------------------------------
+    # Detect repeated sentences.
 
-    visual_words = set(
-        re.findall(
-            r"\b[a-zA-Z]{4,}\b",
-            visual_description.lower(),
+    normalized = [
+        re.sub(
+            r"[^a-z0-9 ]",
+            "",
+            s.lower(),
         )
-    )
+        for s in sentences
+    ]
 
-    story_words = set(
-        re.findall(
-            r"\b[a-zA-Z]{4,}\b",
-            story.lower(),
-        )
-    )
-
-    ignored_words = {
-        "picture",
-        "image",
-        "visible",
-        "unclear",
-        "something",
-        "there",
-        "appears",
-        "looks",
-        "main",
-        "subject",
-        "setting",
-        "action",
-        "mood",
-        "people",
-        "objects",
-        "colors",
-        "color",
-        "children",
-    }
-
-    useful_visual_words = (
-        visual_words
-        - ignored_words
-    )
-
-    matches = (
-        useful_visual_words
-        & story_words
-    )
-
-    # Require at least two concrete visual connections.
-
-    if len(matches) < 2:
+    if len(normalized) != len(
+        set(normalized)
+    ):
 
         return False
 
     return True
-
-
-# ============================================================
-# FALLBACK STORY
-# ============================================================
-
-def fallback_story(
-    visual_description,
-    age_group,
-):
-
-    """
-    Used if the model produces an incomplete or unsafe story.
-
-    This is intentionally simple but guarantees that the
-    application has a complete story instead of showing
-    an unfinished generation.
-    """
-
-    settings = get_age_settings(
-        age_group
-    )
-
-    # Keep the visual description compact.
-
-    description = re.sub(
-        r"\s+",
-        " ",
-        visual_description,
-    ).strip()
-
-    if age_group == "3–5":
-
-        sentences = [
-            f"In the picture, we can see {description}.",
-            "It looked like the beginning of a happy little adventure.",
-            "Everyone enjoyed discovering the wonderful scene together.",
-            "At the end, everyone smiled and felt happy.",
-        ]
-
-    elif age_group == "6–7":
-
-        sentences = [
-            f"The picture showed {description}.",
-            "It looked like the perfect place for a small adventure.",
-            "Everyone noticed something interesting in the scene.",
-            "They explored carefully and happily.",
-            "Soon, they discovered a special moment together.",
-            "The adventure ended with everyone smiling.",
-        ]
-
-    else:
-
-        sentences = [
-            f"The picture showed {description}.",
-            "It looked like the beginning of a wonderful adventure.",
-            "The characters noticed several interesting details around them.",
-            "They decided to explore the scene together.",
-            "Along the way, something unexpected caught their attention.",
-            "They used their imagination to turn the moment into a special adventure.",
-            "Everyone enjoyed the experience and shared a happy moment.",
-            "At the end, they went home with wonderful memories.",
-        ]
-
-    return " ".join(
-        sentences[
-            :settings["sentences"]
-        ]
-    )
-
-
-# ============================================================
-# COMPLETE STORY CREATION
-# ============================================================
-
-def create_story(
-    image,
-    age_group,
-    story_style,
-):
-
-    # --------------------------------------------------------
-    # 1. Analyze image
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "👀 Looking carefully at your picture..."
-    ):
-
-        visual_description = analyze_image(
-            image
-        )
-
-    # --------------------------------------------------------
-    # Show what the model saw.
-    # --------------------------------------------------------
-
-    with st.expander(
-        "🔎 What I noticed in the picture"
-    ):
-
-        st.write(
-            visual_description
-        )
-
-    # --------------------------------------------------------
-    # 2. Generate story
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "🪄 Creating a story from your picture..."
-    ):
-
-        story = generate_story(
-            image=image,
-            visual_description=visual_description,
-            age_group=age_group,
-            story_style=story_style,
-        )
-
-    # --------------------------------------------------------
-    # 3. Validate
-    # --------------------------------------------------------
-
-    if validate_story(
-        story,
-        visual_description,
-        age_group,
-    ):
-
-        return (
-            story,
-            visual_description,
-        )
-
-    # --------------------------------------------------------
-    # 4. Retry once with stronger instruction.
-    # --------------------------------------------------------
-
-    st.info(
-        "🪄 The first story wasn't quite right, "
-        "so I'm trying again with the picture details."
-    )
-
-    story = generate_story(
-        image=image,
-        visual_description=visual_description,
-        age_group=age_group,
-        story_style=story_style,
-    )
-
-    if validate_story(
-        story,
-        visual_description,
-        age_group,
-    ):
-
-        return (
-            story,
-            visual_description,
-        )
-
-    # --------------------------------------------------------
-    # 5. Guaranteed fallback.
-    # --------------------------------------------------------
-
-    story = fallback_story(
-        visual_description,
-        age_group,
-    )
-
-    return (
-        story,
-        visual_description,
-    )
-
-
-# ============================================================
-# SPEAKER EMBEDDING
-# ============================================================
-
-@st.cache_resource
-def load_speaker_embedding():
-
-    zip_path = hf_hub_download(
-        repo_id=SPEAKER_REPO,
-        filename="spkrec-xvect.zip",
-        repo_type="dataset",
-    )
-
-    with zipfile.ZipFile(
-        zip_path,
-        "r",
-    ) as archive:
-
-        files = sorted(
-            [
-                name
-                for name in archive.namelist()
-                if name.endswith(".npy")
-            ]
-        )
-
-        if SPEAKER_INDEX >= len(files):
-
-            raise RuntimeError(
-                "Speaker embedding not found."
-            )
-
-        selected_file = files[
-            SPEAKER_INDEX
-        ]
-
-        with archive.open(
-            selected_file
-        ) as file:
-
-            embedding = np.load(
-                file
-            )
-
-    embedding = torch.tensor(
-        embedding,
-        dtype=torch.float32,
-    )
-
-    if embedding.ndim == 1:
-
-        embedding = embedding.unsqueeze(0)
-
-    return embedding
-
-
-# ============================================================
-# TTS MODELS
-# ============================================================
-
-@st.cache_resource
-def load_tts_models():
-
-    processor = SpeechT5Processor.from_pretrained(
-        TTS_MODEL
-    )
-
-    model = SpeechT5ForTextToSpeech.from_pretrained(
-        TTS_MODEL
-    )
-
-    vocoder = SpeechT5HifiGan.from_pretrained(
-        TTS_VOCODER
-    )
-
-    model.to(DEVICE)
-    vocoder.to(DEVICE)
-
-    model.eval()
-    vocoder.eval()
-
-    return (
-        processor,
-        model,
-        vocoder,
-    )
-
-
-# ============================================================
-# TTS SENTENCE SPLITTING
-# ============================================================
-
-def split_for_tts(text):
-
-    sentences = split_sentences(
-        text
-    )
-
-    chunks = []
-
-    for sentence in sentences:
-
-        sentence = sentence.strip()
-
-        if not sentence:
-            continue
-
-        # Keep chunks short enough for SpeechT5.
-
-        if len(sentence) <= 90:
-
-            chunks.append(
-                sentence
-            )
-
-            continue
-
-        # ----------------------------------------------------
-        # Split long sentences by words.
-        # ----------------------------------------------------
-
-        words = sentence.split()
-
-        current = ""
-
-        for word in words:
-
-            candidate = (
-                f"{current} {word}".strip()
-            )
-
-            if len(candidate) <= 90:
-
-                current = candidate
-
-            else:
-
-                if current:
-
-                    chunks.append(
-                        current
-                    )
-
-                current = word
-
-        if current:
-
-            chunks.append(
-                current
-            )
-
-    return chunks
-
-
-# ============================================================
-# TEXT TO SPEECH
-# ============================================================
-
-def text_to_speech(text):
-
-    try:
-
-        chunks = split_for_tts(
-            text
-        )
-
-        if not chunks:
-
-            raise ValueError(
-                "There is no text to read."
-            )
-
-        speaker = load_speaker_embedding()
-
-        speaker = speaker.to(
-            DEVICE
-        )
-
-        (
-            processor,
-            model,
-            vocoder,
-        ) = load_tts_models()
-
-        audio_parts = []
-
-        progress = st.progress(
-            0,
-            text="🔊 Preparing the storyteller..."
-        )
-
-        for index, chunk in enumerate(
-            chunks
-        ):
-
-            progress.progress(
-                (index + 1) / len(chunks),
-                text=(
-                    f"🔊 Reading sentence "
-                    f"{index + 1} of "
-                    f"{len(chunks)}..."
-                ),
-            )
-
-            inputs = processor(
-                text=chunk,
-                return_tensors="pt",
-            )
-
-            input_ids = inputs[
-                "input_ids"
-            ].to(DEVICE)
-
-            with torch.no_grad():
-
-                speech = (
-                    model.generate_speech(
-                        input_ids,
-                        speaker,
-                        vocoder=vocoder,
-                        maxlenratio=8.0,
-                        minlenratio=1.0,
-                    )
-                )
-
-            audio = (
-                speech
-                .detach()
-                .cpu()
-                .numpy()
-                .astype(np.float32)
-            )
-
-            # Small pause between sentences.
-
-            pause = np.zeros(
-                int(
-                    SAMPLE_RATE
-                    * 0.12
-                ),
-                dtype=np.float32,
-            )
-
-            audio_parts.append(
-                np.concatenate(
-                    [
-                        audio,
-                        pause,
-                    ]
-                )
-            )
-
-        progress.empty()
-
-        combined_audio = np.concatenate(
-            audio_parts
-        )
-
-        buffer = io.BytesIO()
-
-        sf.write(
-            buffer,
-            combined_audio,
-            SAMPLE_RATE,
-            format="WAV",
-        )
-
-        buffer.seek(0)
-
-        audio_bytes = buffer.read()
-
-        if not audio_bytes:
-
-            raise RuntimeError(
-                "No audio was generated."
-            )
-
-        return audio_bytes
-
-    except Exception as error:
-
-        st.error(
-            f"TTS error: "
-            f"{type(error).__name__}: "
-            f"{error}"
-        )
-
-        return None
-
-
-# ============================================================
-# RESET
-# ============================================================
-
-def reset_app():
-
-    for key in [
-        "story",
-        "description",
-        "audio",
-    ]:
-
-        if key in st.session_state:
-
-            del st.session_state[key]
 
 
 # ============================================================
@@ -1273,7 +612,7 @@ def main():
     # --------------------------------------------------------
 
     st.markdown(
-        '<div class="title">'
+        '<div class="main-title">'
         '🌈 My Story Maker'
         '</div>',
         unsafe_allow_html=True,
@@ -1291,17 +630,18 @@ def main():
     # --------------------------------------------------------
 
     st.subheader(
-        "1️⃣ Who is the story for?"
+        "👧 1. How old is the storyteller?"
     )
 
     age_group = st.radio(
-        "Choose an age",
+        "Age",
         [
             "3–5",
             "6–7",
             "8–10",
         ],
         horizontal=True,
+        label_visibility="collapsed",
     )
 
     # --------------------------------------------------------
@@ -1309,31 +649,31 @@ def main():
     # --------------------------------------------------------
 
     st.subheader(
-        "2️⃣ Choose an adventure"
+        "✨ 2. Choose a story style"
     )
 
     story_style = st.selectbox(
-        "Story style",
+        "Style",
         [
-            "🐉 Magical",
-            "🐾 Animal adventure",
-            "🚀 Space adventure",
-            "😂 Funny",
-            "🌳 Nature adventure",
+            "Magical adventure 🪄",
+            "Animal adventure 🐶",
+            "Funny adventure 😂",
+            "Space adventure 🚀",
+            "Nature adventure 🌳",
         ],
         label_visibility="collapsed",
     )
 
     # --------------------------------------------------------
-    # Upload
+    # Image
     # --------------------------------------------------------
 
     st.subheader(
-        "3️⃣ Choose a picture"
+        "📸 3. Choose a picture"
     )
 
     uploaded_file = st.file_uploader(
-        "Upload a picture",
+        "Upload your picture",
         type=[
             "jpg",
             "jpeg",
@@ -1347,12 +687,12 @@ def main():
 
         st.markdown(
             """
-            <div class="hint-box">
+            <div class="tip-box">
 
-            <h3>💡 Try a picture of...</h3>
+            <h3>💡 Try a picture of:</h3>
 
-            🧸 A favorite toy<br>
-            🐶 A pet<br>
+            🧸 Your favorite toy<br>
+            🐶 Your pet<br>
             🌳 A park<br>
             🏰 A castle<br>
             🚲 A bicycle<br>
@@ -1366,7 +706,7 @@ def main():
         return
 
     # --------------------------------------------------------
-    # Open image
+    # Load image
     # --------------------------------------------------------
 
     try:
@@ -1375,11 +715,18 @@ def main():
             uploaded_file
         ).convert("RGB")
 
-    except Exception:
+        image = prepare_image(
+            image
+        )
+
+    except Exception as error:
 
         st.error(
-            "I couldn't open this picture. "
-            "Please try a JPG or PNG image."
+            "I couldn't open this picture."
+        )
+
+        st.exception(
+            error
         )
 
         return
@@ -1391,7 +738,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Generate story
+    # Generate
     # --------------------------------------------------------
 
     if st.button(
@@ -1400,36 +747,63 @@ def main():
         width="stretch",
     ):
 
-        reset_app()
+        # Remove old result.
+
+        st.session_state.pop(
+            "story",
+            None,
+        )
 
         try:
 
-            (
-                story,
-                description,
-            ) = create_story(
-                image=image,
-                age_group=age_group,
-                story_style=story_style,
-            )
+            with st.spinner(
+                "👀 Looking at your picture..."
+            ):
 
-            # Store EXACTLY what is displayed.
+                story = generate_story(
+                    image=image,
+                    age_group=age_group,
+                    story_style=story_style,
+                )
+
+            if not validate_story(
+                story,
+                age_group,
+            ):
+
+                st.warning(
+                    "The story was incomplete, "
+                    "so I made a new simple story."
+                )
+
+                story = fallback_story(
+                    age_group
+                )
 
             st.session_state[
                 "story"
             ] = story
 
-            st.session_state[
-                "description"
-            ] = description
-
         except Exception as error:
 
             st.error(
-                "I couldn't make the story right now."
+                "The story generator encountered "
+                "an error."
             )
 
-            st.exception(error)
+            # VERY IMPORTANT during development:
+            # Streamlit Cloud normally hides details.
+            # This shows the actual exception so that
+            # we can diagnose the next issue.
+
+            st.exception(
+                error
+            )
+
+            st.info(
+                "If you send me the error shown above, "
+                "I can identify the exact problem."
+            )
 
             return
 
@@ -1461,82 +835,23 @@ def main():
             unsafe_allow_html=True,
         )
 
-        # ----------------------------------------------------
-        # Audio
-        # ----------------------------------------------------
-
-        st.subheader(
-            "🔊 Listen to your story"
+        st.success(
+            "🎉 Your story is complete!"
         )
 
-        if st.button(
-            "🎵 Read My Story",
-            width="stretch",
-        ):
-
-            with st.spinner(
-                "🎵 Making the audio..."
-            ):
-
-                audio = text_to_speech(
-                    st.session_state[
-                        "story"
-                    ]
-                )
-
-            if audio:
-
-                st.session_state[
-                    "audio"
-                ] = audio
-
-                st.success(
-                    "🎉 Your story is ready!"
-                )
-
         # ----------------------------------------------------
-        # Player
+        # TTS intentionally disabled for this diagnostic
+        # version.
         # ----------------------------------------------------
 
-        if st.session_state.get(
-            "audio"
-        ):
-
-            st.audio(
-                st.session_state[
-                    "audio"
-                ],
-                format="audio/wav",
-            )
-
-            st.download_button(
-                "⬇️ Download audio",
-                data=st.session_state[
-                    "audio"
-                ],
-                file_name="my_story.wav",
-                mime="audio/wav",
-                width="stretch",
-            )
-
-        # ----------------------------------------------------
-        # New story
-        # ----------------------------------------------------
-
-        st.write("")
-
-        if st.button(
-            "🌟 Make Another Story",
-            width="stretch",
-        ):
-
-            reset_app()
-
-            st.rerun()
+        st.info(
+            "🔊 Audio will be added after story generation "
+            "is working reliably."
+        )
 
 
 # ============================================================
-# RUN
+# START APP
 # ============================================================
 
 if __name__ == "__main__":
