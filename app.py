@@ -48,6 +48,19 @@ def img2text(image_file):
     return blip_processor.decode(out[0], skip_special_tokens=True)
 
 def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model, device=device):
+    def run_prompt(prompt):
+        inputs = text_tokenizer(prompt, return_tensors="pt").to(device)
+        output = text_model.generate(
+            **inputs,
+            max_new_tokens=150,
+            min_length=60,
+            do_sample=True,
+            temperature=0.8,
+            top_p=0.9
+        )
+        return text_tokenizer.decode(output[0], skip_special_tokens=True).strip()
+
+    # First attempt
     prompt = (
         f"Create a bedtime story for children aged 3–10. "
         f"Make it warm, simple, and magical. "
@@ -55,25 +68,17 @@ def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model
         f"Base it on this idea: {caption}. "
         f"End with a happy feeling."
     )
-    inputs = text_tokenizer(prompt, return_tensors="pt").to(device)
-    output = text_model.generate(
-        **inputs,
-        max_new_tokens=150,
-        min_length=60,
-        do_sample=True,
-        temperature=0.8,
-        top_p=0.9
-    )
-    story = text_tokenizer.decode(output[0], skip_special_tokens=True).strip()
+    story = run_prompt(prompt)
 
-    # ✅ Fallback if model outputs irrelevant or repetitive text
+    # Retry if output looks irrelevant
     bad_phrases = ["series", "post", "collection", "book"]
     if any(bp in story.lower() for bp in bad_phrases):
-        story = (
-            "Once upon a time, children played happily in the park. "
-            "They laughed together, shared their toys, and discovered magical adventures among the trees. "
-            "As the sun set, they went home with smiles, ready for sweet dreams."
+        retry_prompt = (
+            f"Write a bedtime story starting with 'Once upon a time'. "
+            f"Make sure it has a main character, a small adventure, and a happy ending. "
+            f"The theme is: {caption}."
         )
+        story = run_prompt(retry_prompt)
 
     return story
 
@@ -94,7 +99,6 @@ def story_to_audio(story_text):
             sf.write(buf, samples, rate, format="WAV")
             buf.seek(0)
             audio_buffers.append(buf.read())
-        # Concatenate audio chunks
         return b"".join(audio_buffers)
     except Exception:
         return None
@@ -115,7 +119,6 @@ def main():
     uploaded_file = st.file_uploader("📷 Upload an image", type=["jpg", "jpeg", "png"])
     if uploaded_file is not None:
         image = Image.open(uploaded_file)
-        # ✅ FIX: use_container_width instead of use_column_width
         st.image(image, caption="Your Picture", use_container_width=True)
 
         if st.button("Generate Story"):
