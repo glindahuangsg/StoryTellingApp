@@ -68,14 +68,14 @@ def image_to_text(image):
 # STORY GENERATION (child‑friendly, no echoes)
 # ============================================================
 
-def generate_story(description, age_group, style):
+def generate_story(description, age_group, story_style):
     tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL)
     model = AutoModelForCausalLM.from_pretrained(TEXT_MODEL).to(DEVICE).eval()
 
     lengths = {
-        "3–5": (120, "Write 3–5 very short sentences with simple words."),
-        "6–7": (160, "Write 5–7 short sentences with playful descriptions."),
-        "8–10": (200, "Write 7–10 sentences with imaginative language."),
+        "3–5": (120, "Use 3–5 very short sentences with simple words."),
+        "6–7": (160, "Use 5–7 short sentences with playful descriptions."),
+        "8–10": (200, "Use 7–10 sentences with imaginative language."),
     }
     max_tokens, length_instruction = lengths.get(age_group, (150, ""))
 
@@ -85,31 +85,45 @@ def generate_story(description, age_group, style):
         "🐾 Animal": "Make friendly animals important characters.",
         "😂 Funny": "Include something silly and funny.",
     }
-    style_instruction = styles.get(style, "Make it a warm children's story.")
+    style_instruction = styles.get(story_style, "Make it a warm children's story.")
 
+    # Refined prompt: no “Write only the story:” line
     prompt = f"""
-Tell a children's story based on this picture: {description}.
-The child is {age_group} years old.
+Write a children's bedtime story.
+Picture description: {description}
+Child age: {age_group}
 {length_instruction}
 {style_instruction}
-Use simple, warm, imaginative language. Do not repeat instructions. Begin directly with the story.
+Guidelines: keep it safe, warm, imaginative; no violence, weapons, frightening scenes, or adult topics.
+Begin directly with the story. Do not repeat instructions.
 End with a happy or reassuring feeling.
 """
 
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
     with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=True,
-                                temperature=0.7, top_p=0.9, repetition_penalty=1.05)
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            num_beams=3,  # beam search for coherence
+        )
+
     story = tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-    # Remove any leftover instruction echoes
-    for marker in ["Tell a children's story", "Rules:", "The child is"]:
+    # Post‑processing: remove echoes
+    unwanted = ["Picture description:", "Child age:", "Guidelines:", "Write a children's bedtime story"]
+    for marker in unwanted:
         if marker in story:
             story = story.split(marker)[-1].strip()
 
+    # Ensure it ends nicely
     if not story.endswith((".", "!", "?")):
         story += " And everyone was happy at the end."
+
     return story
+
 
 # ============================================================
 # TEXT → SPEECH
