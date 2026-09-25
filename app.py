@@ -17,10 +17,6 @@ from transformers import (
 )
 from huggingface_hub import hf_hub_download
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 VISION_MODEL = "Salesforce/blip-image-captioning-base"
 TEXT_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 TTS_MODEL = "microsoft/speecht5_tts"
@@ -31,10 +27,6 @@ SAMPLE_RATE = 16000
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 st.set_page_config(page_title="My Story Maker", page_icon="🌈", layout="centered")
-
-# ============================================================
-# UTILITIES
-# ============================================================
 
 def cleanup():
     gc.collect()
@@ -52,10 +44,6 @@ def load_speaker_embedding():
             emb = np.load(f)
     return torch.tensor(emb, dtype=torch.float32).unsqueeze(0)
 
-# ============================================================
-# IMAGE → DESCRIPTION
-# ============================================================
-
 def image_to_text(image):
     processor = BlipProcessor.from_pretrained(VISION_MODEL)
     model = BlipForConditionalGeneration.from_pretrained(VISION_MODEL).to(DEVICE).eval()
@@ -64,37 +52,30 @@ def image_to_text(image):
         output = model.generate(**inputs, max_new_tokens=40, num_beams=3)
     return processor.decode(output[0], skip_special_tokens=True).strip()
 
-# ============================================================
-# STORY GENERATION (child‑friendly, no echoes)
-# ============================================================
-
-def generate_story(description, age_group, story_style):
+def generate_story(description, age_group, style):
     tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL)
     model = AutoModelForCausalLM.from_pretrained(TEXT_MODEL).to(DEVICE).eval()
 
-    # Age-specific length
     lengths = {
-        "3–5": (150, "Tell a short bedtime story in 4–6 sentences using very simple words."),
-        "6–7": (180, "Tell a playful story in 6–8 sentences with simple descriptions."),
-        "8–10": (220, "Tell an imaginative story in 8–10 sentences with easy-to-understand language."),
+        "3–5": (150, "tell a gentle bedtime story in 4–6 sentences."),
+        "6–7": (180, "tell a playful story in 6–8 sentences."),
+        "8–10": (220, "tell an imaginative story in 8–10 sentences."),
     }
     max_tokens, length_instruction = lengths.get(age_group, (180, ""))
 
     styles = {
-        "🐉 Magical": "Make it a gentle magical adventure.",
-        "🚀 Adventure": "Make it a fun and safe adventure.",
-        "🐾 Animal": "Make friendly animals important characters.",
-        "😂 Funny": "Include something silly and funny.",
+        "🐉 Magical": "make it a magical adventure.",
+        "🚀 Adventure": "make it a fun adventure.",
+        "🐾 Animal": "include friendly animals.",
+        "😂 Funny": "make it silly and funny.",
     }
-    style_instruction = styles.get(story_style, "Make it a warm children's story.")
+    style_instruction = styles.get(style, "make it warm and cheerful.")
 
-    # Refined prompt: direct storytelling
     prompt = f"""
-Once upon a time, {description}.
+once upon a time, {description}.
 {length_instruction}
 {style_instruction}
-Use simple, warm, imaginative language. Do not repeat instructions.
-End with a happy or reassuring feeling.
+use simple words and warm feelings. do not repeat instructions. begin directly with the story. end with a happy or reassuring feeling.
 """
 
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
@@ -105,28 +86,27 @@ End with a happy or reassuring feeling.
             do_sample=True,
             temperature=0.8,
             top_p=0.9,
-            num_beams=4,  # beam search for coherence
-            min_length=80,  # enforce minimum length
+            num_beams=4,
+            min_length=80,
         )
 
     story = tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-    # Remove any leftover prompt echoes
-    if story.lower().startswith("once upon a time"):
-        pass
-    else:
-        # force it to start like a children's story
-        story = "Once upon a time, " + story
+    # filter out instruction echoes
+    unwanted = ["tell a", "use simple", "do not repeat", "end with"]
+    for marker in unwanted:
+        if marker in story.lower():
+            story = story.split(marker)[0].strip()
 
-    # Ensure it ends nicely
+    # ensure it starts like a story
+    if not story.lower().startswith("once upon a time"):
+        story = "once upon a time, " + story
+
+    # ensure it ends nicely
     if not story.endswith((".", "!", "?")):
-        story += " And everyone was happy at the end."
+        story += " everyone was happy at the end."
 
     return story
-
-# ============================================================
-# TEXT → SPEECH
-# ============================================================
 
 def text_to_speech(text):
     chunks = re.split(r"(?<=[.!?])\s+", text.strip())
@@ -149,70 +129,56 @@ def text_to_speech(text):
     buf.seek(0)
     return buf.read()
 
-# ============================================================
-# RESET
-# ============================================================
-
 def reset_story():
     for key in ["description", "story", "audio"]:
         st.session_state.pop(key, None)
 
-# ============================================================
-# MAIN APP
-# ============================================================
-
 def main():
-    st.markdown('<div class="title">🌈 My Story Maker</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">Turn a picture into a magical story!</div>', unsafe_allow_html=True)
+    st.markdown('<div class="title">🌈 my story maker</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">turn a picture into a magical story!</div>', unsafe_allow_html=True)
 
-    st.subheader("✨ Choose your story")
+    st.subheader("✨ choose your story")
     col1, col2 = st.columns(2)
-    age_group = col1.selectbox("Age", ["3–5", "6–7", "8–10"])
-    story_style = col2.selectbox("Story type", ["🐉 Magical", "🚀 Adventure", "🐾 Animal", "😂 Funny"])
+    age_group = col1.selectbox("age", ["3–5", "6–7", "8–10"])
+    story_style = col2.selectbox("story type", ["🐉 magical", "🚀 adventure", "🐾 animal", "😂 funny"])
 
-    st.subheader("📸 Choose a picture")
-    uploaded_file = st.file_uploader("Upload a picture", type=["jpg", "jpeg", "png", "webp"], label_visibility="collapsed")
+    st.subheader("📸 choose a picture")
+    uploaded_file = st.file_uploader("upload a picture", type=["jpg", "jpeg", "png", "webp"], label_visibility="collapsed")
     if not uploaded_file:
-        st.info("💡 Try a picture of a toy, pet, park, castle, bicycle, or drawing.")
+        st.info("💡 try a picture of a toy, pet, park, castle, bicycle, or drawing.")
         return
 
     image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Your picture", use_container_width=True)
+    st.image(image, caption="your picture", use_container_width=True)
 
-    if st.button("✨ Make My Story! ✨", type="primary", use_container_width=True):
+    if st.button("✨ make my story! ✨", type="primary", use_container_width=True):
         reset_story()
-        with st.spinner("👀 Looking at your picture..."):
+        with st.spinner("👀 looking at your picture..."):
             st.session_state["description"] = image_to_text(image)
-        with st.spinner("🪄 Creating your story..."):
+        with st.spinner("🪄 creating your story..."):
             st.session_state["story"] = generate_story(st.session_state["description"], age_group, story_style)
 
     if "description" in st.session_state:
-        with st.expander("👀 What I saw in the picture"):
+        with st.expander("👀 what i saw in the picture"):
             st.write(st.session_state["description"])
 
     if "story" in st.session_state:
-        st.subheader("📖 Your Story")
-        st.markdown('<div class="story-box">', unsafe_allow_html=True)
+        st.subheader("📖 your story")
         st.write(st.session_state["story"])
-        st.markdown("</div>", unsafe_allow_html=True)
 
-        st.subheader("🔊 Listen to your story")
-        if st.button("🎵 Read My Story", use_container_width=True):
-            with st.spinner("🎵 Making the audio..."):
+        st.subheader("🔊 listen to your story")
+        if st.button("🎵 read my story", use_container_width=True):
+            with st.spinner("🎵 making the audio..."):
                 st.session_state["audio"] = text_to_speech(st.session_state["story"])
-            st.success("🎉 Your story is ready!")
+            st.success("🎉 your story is ready!")
 
         if st.session_state.get("audio"):
             st.audio(st.session_state["audio"], format="audio/wav")
-            st.download_button("⬇️ Download audio", st.session_state["audio"], "my_story.wav", "audio/wav")
+            st.download_button("⬇️ download audio", st.session_state["audio"], "my_story.wav", "audio/wav")
 
-        if st.button("🌟 Make Another Story", use_container_width=True):
+        if st.button("🌟 make another story", use_container_width=True):
             reset_story()
             st.rerun()
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
     main()
