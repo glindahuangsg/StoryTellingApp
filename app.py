@@ -206,4 +206,4 @@ Write the full story here:
 
 # ENTRY POINT
 if __name__ == "__main__":
-    main()
+    run_app()   # or whatever you renamed it to
