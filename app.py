@@ -48,21 +48,32 @@ def img2text(image_file):
     return blip_processor.decode(out[0], skip_special_tokens=True)
 
 def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model, device=device):
-    prompt = f"Write a short bedtime story for children aged 3–10 about: {caption}. End happily."
+    prompt = (
+        f"Create a bedtime story for children aged 3–10. "
+        f"Make it warm, simple, and magical. "
+        f"Include a beginning, middle, and end. "
+        f"Base it on this idea: {caption}. "
+        f"End with a happy feeling."
+    )
     inputs = text_tokenizer(prompt, return_tensors="pt").to(device)
     output = text_model.generate(
         **inputs,
-        max_new_tokens=120,
-        min_length=50,
+        max_new_tokens=150,
+        min_length=60,
         do_sample=True,
         temperature=0.8,
         top_p=0.9
     )
     story = text_tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-    # ✅ Fallback if model outputs irrelevant text
-    if "series" in story.lower() or "post" in story.lower():
-        story = "Once upon a time, children played happily in the park. They laughed, shared, and learned kindness. As the sun set, they went home with smiles, ready for sweet dreams."
+    # ✅ Fallback if model outputs irrelevant or repetitive text
+    bad_phrases = ["series", "post", "collection", "book"]
+    if any(bp in story.lower() for bp in bad_phrases):
+        story = (
+            "Once upon a time, children played happily in the park. "
+            "They laughed together, shared their toys, and discovered magical adventures among the trees. "
+            "As the sun set, they went home with smiles, ready for sweet dreams."
+        )
 
     return story
 
