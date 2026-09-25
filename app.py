@@ -17,14 +17,13 @@ device = torch.device("cpu")
 # Load models once
 @st.cache_resource
 def load_models():
-    # Use BLIP base (lighter than large)
     blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
     blip_model = BlipForConditionalGeneration.from_pretrained(
         "Salesforce/blip-image-captioning-base",
         torch_dtype=torch.float32
     ).to(device)
 
-    # ✅ Swap to a smaller text model (distilgpt2 is lightweight)
+    # ✅ Lightweight text model
     text_model_id = "distilgpt2"
     text_tokenizer = AutoTokenizer.from_pretrained(text_model_id)
     if text_tokenizer.pad_token_id is None:
@@ -34,9 +33,11 @@ def load_models():
         torch_dtype=torch.float32
     ).to(device)
 
-    # ✅ Use a smaller TTS model (lightweight alternative)
-    tts = pipeline("text-to-speech", model="facebook/mms-tts-eng")
-
+    # ✅ TTS pipeline (may fail on low memory)
+    try:
+        tts = pipeline("text-to-speech", model="facebook/mms-tts-eng")
+    except Exception:
+        tts = None  # fallback mode
     return blip_processor, blip_model, text_tokenizer, text_model, tts
 
 blip_processor, blip_model, text_tokenizer, text_model, tts = load_models()
@@ -45,7 +46,7 @@ blip_processor, blip_model, text_tokenizer, text_model, tts = load_models()
 def img2text(image_file):
     raw_image = Image.open(image_file).convert("RGB")
     inputs = blip_processor(raw_image, return_tensors="pt").to(device)
-    out = blip_model.generate(**inputs, max_new_tokens=20)  # ✅ shorter caption
+    out = blip_model.generate(**inputs, max_new_tokens=20)
     return blip_processor.decode(out[0], skip_special_tokens=True)
 
 def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model, device=device):
@@ -53,7 +54,7 @@ def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model
     inputs = text_tokenizer(prompt, return_tensors="pt").to(device)
     output = text_model.generate(
         **inputs,
-        max_new_tokens=120,   # ✅ reduced length
+        max_new_tokens=120,
         min_length=50,
         do_sample=True,
         temperature=0.8,
@@ -72,13 +73,18 @@ def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model
     return story
 
 def story_to_audio(story_text):
-    audio_out = tts(story_text)
-    samples = audio_out["audio"]
-    rate = audio_out["sampling_rate"]
-    buf = io.BytesIO()
-    sf.write(buf, samples, rate, format="WAV")
-    buf.seek(0)
-    return buf.read()
+    if tts is None:
+        return None
+    try:
+        audio_out = tts(story_text)
+        samples = audio_out["audio"]
+        rate = audio_out["sampling_rate"]
+        buf = io.BytesIO()
+        sf.write(buf, samples, rate, format="WAV")
+        buf.seek(0)
+        return buf.read()
+    except Exception:
+        return None
 
 # Streamlit UI
 def main():
@@ -96,7 +102,8 @@ def main():
     uploaded_file = st.file_uploader("📷 Upload an image", type=["jpg", "jpeg", "png"])
     if uploaded_file is not None:
         image = Image.open(uploaded_file)
-        st.image(image, caption="Your Picture", use_column_width=True)
+        # ✅ FIX: use_container_width instead of use_column_width
+        st.image(image, caption="Your Picture", use_container_width=True)
 
         if st.button("Generate Story"):
             caption = img2text(uploaded_file)
@@ -110,7 +117,10 @@ def main():
             )
 
             audio_bytes = story_to_audio(story)
-            st.audio(audio_bytes, format="audio/wav")
+            if audio_bytes:
+                st.audio(audio_bytes, format="audio/wav")
+            else:
+                st.warning("🔊 Audio unavailable due to memory limits. Please enjoy reading the story!")
 
 if __name__ == "__main__":
     main()
