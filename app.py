@@ -52,59 +52,75 @@ def image_to_text(image):
         output = model.generate(**inputs, max_new_tokens=40, num_beams=3)
     return processor.decode(output[0], skip_special_tokens=True).strip()
 
-def generate_story(description, age_group, style):
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+def generate_story(description, age_group="3–5", story_style="🐉 Magical"):
     tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL)
     model = AutoModelForCausalLM.from_pretrained(TEXT_MODEL).to(DEVICE).eval()
 
-    lengths = {
-        "3–5": (150, "tell a gentle bedtime story in 4–6 sentences."),
-        "6–7": (180, "tell a playful story in 6–8 sentences."),
-        "8–10": (220, "tell an imaginative story in 8–10 sentences."),
-    }
-    max_tokens, length_instruction = lengths.get(age_group, (180, ""))
+    max_tokens = 250 if age_group == "3–5" else 350
 
-    styles = {
-        "🐉 Magical": "make it a magical adventure.",
-        "🚀 Adventure": "make it a fun adventure.",
-        "🐾 Animal": "include friendly animals.",
-        "😂 Funny": "make it silly and funny.",
+    style_map = {
+        "🐉 Magical": "magical adventure with gentle magic",
+        "🚀 Adventure": "fun and exciting journey",
+        "🐾 Animal": "heartwarming animal story",
+        "😂 Funny": "silly and humorous story",
     }
-    style_instruction = styles.get(style, "make it warm and cheerful.")
+    style_desc = style_map.get(story_style, "warm children's story")
 
-    prompt = f"""
-once upon a time, {description}.
-{length_instruction}
-{style_instruction}
-use simple words and warm feelings. do not repeat instructions. begin directly with the story. end with a happy or reassuring feeling.
-"""
+    # STRICT SYSTEM PROMPT TO FORCE NARRATIVE STRUCTURE
+    system_prompt = (
+        "You are a children's story writer. You write real, structured stories with a clear character, "
+        "a specific mini-adventure, and a satisfying conclusion. "
+        "Do NOT write generic descriptions or list magical things. Tell a simple step-by-step story."
+    )
+
+    user_prompt = f"""Write a short {style_desc} for kids aged {age_group}.
+
+Topic: {description}
+
+Follow this strict story outline:
+1. Introduce ONE main character with a name.
+2. The character starts doing something related to: {description}.
+3. A small problem or curious thing happens.
+4. The character solves it gently and feels happy at the end.
+
+Keep sentences simple and natural."""
+
+    # Format using chat template if model supports it
+    if hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        # Fallback for base models
+        prompt = f"System: {system_prompt}\n\nUser: {user_prompt}\n\nStory:"
 
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
+    prompt_len = inputs["input_ids"].shape[-1]
+
     with torch.no_grad():
         output = model.generate(
             **inputs,
             max_new_tokens=max_tokens,
             do_sample=True,
-            temperature=0.8,
-            top_p=0.9,
-            num_beams=4,
-            min_length=80,
+            temperature=0.4,          # Lower temp prevents random topic jumping
+            top_p=0.85,               # Focused vocabulary selection
+            repetition_penalty=1.2,   # Stops generic phrase loops
+            pad_token_id=tokenizer.eos_token_id,
         )
 
-    story = tokenizer.decode(output[0], skip_special_tokens=True).strip()
+    # Extract generated output
+    generated_tokens = output[0][prompt_len:]
+    story = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
 
-    # filter out instruction echoes
-    unwanted = ["tell a", "use simple", "do not repeat", "end with"]
-    for marker in unwanted:
-        if marker in story.lower():
-            story = story.split(marker)[0].strip()
-
-    # ensure it starts like a story
-    if not story.lower().startswith("once upon a time"):
-        story = "once upon a time, " + story
-
-    # ensure it ends nicely
-    if not story.endswith((".", "!", "?")):
-        story += " everyone was happy at the end."
+    # Truncate at last complete sentence
+    last_punct = max(story.rfind("."), story.rfind("!"), story.rfind("?"))
+    if last_punct != -1:
+        story = story[: last_punct + 1]
 
     return story
 
