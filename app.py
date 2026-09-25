@@ -59,7 +59,7 @@ def img2text(image_file):
 # -----------------------------------------------------------
 # Function: generate_story
 # Purpose: Generate a bedtime story based on the image caption
-# Includes retry logic if the first output is irrelevant
+# Fix: Simplified prompt + strip echoed instructions
 # -----------------------------------------------------------
 def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model, device=device):
     def run_prompt(prompt):
@@ -74,27 +74,25 @@ def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model
         )
         return text_tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-    # First attempt with a general prompt
-    prompt = (
-        f"Create a bedtime story for children aged 3–10. "
-        f"Make it warm, simple, and magical. "
-        f"Include a beginning, middle, and end. "
-        f"Base it on this idea: {caption}. "
-        f"End with a happy feeling."
-    )
+    # ✅ Use a single, clean instruction
+    prompt = f"Once upon a time, tell a short bedtime story for children aged 3–10 about {caption}. End happily."
     story = run_prompt(prompt)
 
-    # Retry with stricter instructions if output looks irrelevant
-    bad_phrases = ["series", "post", "collection", "book"]
-    if any(bp in story.lower() for bp in bad_phrases):
-        retry_prompt = (
-            f"Write a bedtime story starting with 'Once upon a time'. "
-            f"Make sure it has a main character, a small adventure, and a happy ending. "
-            f"The theme is: {caption}."
-        )
+    # ✅ Remove any echoed instruction phrases
+    for phrase in [
+        "create a bedtime story",
+        "make a bedtime story",
+        "include a beginning, middle, and end",
+        "end with a happy feeling"
+    ]:
+        story = story.replace(phrase, "")
+
+    # ✅ Retry with stricter prompt if still irrelevant
+    if any(bp in story.lower() for bp in ["series", "post", "collection", "book"]):
+        retry_prompt = f"Once upon a time, a magical bedtime story about {caption}. Keep it short and end happily."
         story = run_prompt(retry_prompt)
 
-    return story
+    return story.strip()
 
 # -----------------------------------------------------------
 # Function: story_to_audio
