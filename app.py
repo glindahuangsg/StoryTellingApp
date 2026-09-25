@@ -50,8 +50,7 @@ def load_speaker_embedding():
         selected = npy_files[SPEAKER_INDEX]
         with archive.open(selected) as f:
             emb = np.load(f)
-    emb = torch.tensor(emb, dtype=torch.float32).unsqueeze(0)
-    return emb
+    return torch.tensor(emb, dtype=torch.float32).unsqueeze(0)
 
 # ============================================================
 # IMAGE → DESCRIPTION
@@ -66,33 +65,35 @@ def image_to_text(image):
     return processor.decode(output[0], skip_special_tokens=True).strip()
 
 # ============================================================
-# STORY GENERATION
+# STORY GENERATION (child‑friendly, no echoes)
 # ============================================================
 
 def generate_story(description, age_group, style):
     tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL)
     model = AutoModelForCausalLM.from_pretrained(TEXT_MODEL).to(DEVICE).eval()
 
-    lengths = {"3–5": (120, "Write 3–5 very short sentences with simple words."),
-               "6–7": (160, "Write 5–7 short sentences with playful descriptions."),
-               "8–10": (200, "Write 7–10 sentences with imaginative language.")}
+    lengths = {
+        "3–5": (120, "Write 3–5 very short sentences with simple words."),
+        "6–7": (160, "Write 5–7 short sentences with playful descriptions."),
+        "8–10": (200, "Write 7–10 sentences with imaginative language."),
+    }
     max_tokens, length_instruction = lengths.get(age_group, (150, ""))
 
-    styles = {"🐉 Magical": "Make it a gentle magical adventure.",
-              "🚀 Adventure": "Make it a fun and safe adventure.",
-              "🐾 Animal": "Make friendly animals important characters.",
-              "😂 Funny": "Include something silly and funny."}
+    styles = {
+        "🐉 Magical": "Make it a gentle magical adventure.",
+        "🚀 Adventure": "Make it a fun and safe adventure.",
+        "🐾 Animal": "Make friendly animals important characters.",
+        "😂 Funny": "Include something silly and funny.",
+    }
     style_instruction = styles.get(style, "Make it a warm children's story.")
 
     prompt = f"""
-You are a friendly children's story writer.
-The picture shows: {description}
+Tell a children's story based on this picture: {description}.
 The child is {age_group} years old.
 {length_instruction}
 {style_instruction}
-Rules: keep it safe, warm, imaginative; no violence, weapons, frightening scenes, adult topics.
+Use simple, warm, imaginative language. Do not repeat instructions. Begin directly with the story.
 End with a happy or reassuring feeling.
-Write only the story:
 """
 
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
@@ -100,6 +101,12 @@ Write only the story:
         output = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=True,
                                 temperature=0.7, top_p=0.9, repetition_penalty=1.05)
     story = tokenizer.decode(output[0], skip_special_tokens=True).strip()
+
+    # Remove any leftover instruction echoes
+    for marker in ["Tell a children's story", "Rules:", "The child is"]:
+        if marker in story:
+            story = story.split(marker)[-1].strip()
+
     if not story.endswith((".", "!", "?")):
         story += " And everyone was happy at the end."
     return story
