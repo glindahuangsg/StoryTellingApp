@@ -59,37 +59,36 @@ def img2text(image_file):
 # -----------------------------------------------------------
 # Function: generate_story
 # Purpose: Generate a bedtime story based on the image caption
-# Fix: Simplified prompt + strip echoed instructions
+# Fix: Use natural storytelling prompt so output feels like a parent telling a story
 # -----------------------------------------------------------
 def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model, device=device):
     def run_prompt(prompt):
         inputs = text_tokenizer(prompt, return_tensors="pt").to(device)
         output = text_model.generate(
             **inputs,
-            max_new_tokens=150,
-            min_length=60,
+            max_new_tokens=180,
+            min_length=80,
             do_sample=True,
             temperature=0.8,
             top_p=0.9
         )
         return text_tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-    # ✅ Use a single, clean instruction
-    prompt = f"Once upon a time, tell a short bedtime story for children aged 3–10 about {caption}. End happily."
+    # ✅ Warm, narrative-style prompt
+    prompt = (
+        f"Tell a gentle bedtime story for children aged 3–10. "
+        f"Begin with 'Once upon a time' and make it sound like a parent speaking softly. "
+        f"The story should be about {caption}, with a beginning, middle, and happy ending."
+    )
     story = run_prompt(prompt)
 
-    # ✅ Remove any echoed instruction phrases
-    for phrase in [
-        "create a bedtime story",
-        "make a bedtime story",
-        "include a beginning, middle, and end",
-        "end with a happy feeling"
-    ]:
-        story = story.replace(phrase, "")
-
-    # ✅ Retry with stricter prompt if still irrelevant
-    if any(bp in story.lower() for bp in ["series", "post", "collection", "book"]):
-        retry_prompt = f"Once upon a time, a magical bedtime story about {caption}. Keep it short and end happily."
+    # ✅ Retry with simpler narrative if output is meta-text
+    bad_phrases = ["series", "post", "collection", "book"]
+    if any(bp in story.lower() for bp in bad_phrases):
+        retry_prompt = (
+            f"Once upon a time, there was {caption}. "
+            f"Tell it as a short bedtime story with a happy ending, like a parent speaking to a child."
+        )
         story = run_prompt(retry_prompt)
 
     return story.strip()
