@@ -73,19 +73,18 @@ def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model
         )
         return text_tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-    # ✅ Parental narrator prompt
+    # ✅ Natural storytelling prompt — no repeated directives
     prompt = (
-        f"Tell a gentle bedtime story as if a parent is speaking to their child. "
-        f"Begin with 'Once upon a time, my dear' and use warm, caring language. "
-        f"The story should be about {caption}, with a clear beginning, middle, and happy ending. "
-        f"Speak directly to the child with phrases like 'little one' or 'sweetheart'. "
-        f"Do not always start with 'The boy' or 'The girl'. "
+        f"Once upon a time, my dear, let me tell you a gentle bedtime story. "
+        f"This story is about {caption}. "
+        f"It should sound like a parent speaking softly to their child, "
+        f"with a clear beginning, middle, and a happy ending. "
         f"End with a comforting line such as 'and now you can rest peacefully, knowing everything is safe and happy.'"
     )
     story = run_prompt(prompt)
 
     # ✅ Retry with simpler parental voice if output is meta-text
-    bad_phrases = ["series", "post", "collection", "book"]
+    bad_phrases = ["series", "post", "collection", "book", "illustration"]
     if any(bp in story.lower() for bp in bad_phrases):
         retry_prompt = (
             f"Once upon a time, my dear, there was {caption}. "
