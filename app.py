@@ -11,7 +11,7 @@ from PIL import Image
 import io
 import soundfile as sf
 
-# ? Force CPU mode to reduce memory usage
+# ✅ Force CPU mode to reduce memory usage
 device = torch.device("cpu")
 
 # -----------------------------------------------------------
@@ -117,11 +117,11 @@ def story_to_audio(story_text):
 # Purpose: Build the Streamlit UI for the app
 # -----------------------------------------------------------
 def main():
-    st.set_page_config(page_title="Kids Story Generator", page_icon="??", layout="centered")
+    st.set_page_config(page_title="Kids Story Generator", page_icon="📖", layout="centered")
 
-    # ?? Kid-friendly header
+    # 🎨 Kid-friendly header
     st.markdown(
-        "<h1 style='text-align:center; color:#FF69B4;'>?? Magical Storytime ??</h1>",
+        "<h1 style='text-align:center; color:#FF69B4;'>🌟 Magical Storytime 🌟</h1>",
         unsafe_allow_html=True
     )
     st.markdown(
@@ -129,32 +129,32 @@ def main():
         unsafe_allow_html=True
     )
 
-    uploaded_file = st.file_uploader("?? Choose a fun picture", type=["jpg", "jpeg", "png"])
+    uploaded_file = st.file_uploader("📷 Choose a fun picture", type=["jpg", "jpeg", "png"])
     if uploaded_file is not None:
         image = Image.open(uploaded_file)
-        st.image(image, caption="? Your Picture ?", use_container_width=True)
+        st.image(image, caption="✨ Your Picture ✨", use_container_width=True)
 
-        if st.button("?? Generate Story"):
+        if st.button("🎉 Generate Story"):
             caption = img2text(uploaded_file)
-            st.success(f"?? Magic Caption: {caption}")
+            st.success(f"📝 Magic Caption: {caption}")
 
-            # ?? Show friendly waiting message while story loads
-            with st.spinner("? Hold on tight! Your magical bedtime story is being written... ?"):
+            # 🕒 Show friendly waiting message while story loads
+            with st.spinner("✨ Hold on tight! Your magical bedtime story is being written... ✨"):
                 story = generate_story(caption)
 
             # Display story in a playful box
             st.markdown(
                 f"<div style='background-color:#FFFACD; padding:20px; border-radius:15px; font-size:18px;'>"
-                f"<b>?? Your Story:</b><br>{story}</div>",
+                f"<b>📖 Your Story:</b><br>{story}</div>",
                 unsafe_allow_html=True
             )
 
             audio_bytes = story_to_audio(story)
             if audio_bytes:
                 st.audio(audio_bytes, format="audio/wav")
-                st.info("?? Sit back, relax, and listen to your magical story!")
+                st.info("🔊 Sit back, relax, and listen to your magical story!")
             else:
-                st.warning("?? Audio unavailable right now, but you can enjoy reading the story!")
+                st.warning("🔊 Audio unavailable right now, but you can enjoy reading the story!")
 
 # -----------------------------------------------------------
 # Entry point
