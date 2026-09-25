@@ -11,7 +11,8 @@ from PIL import Image
 import io
 import soundfile as sf
 
-
+# ✅ Force CPU mode to reduce memory usage
+device = torch.device("cpu")
 
 # -----------------------------------------------------------
 # Function: load_models
