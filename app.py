@@ -31,9 +31,9 @@ def load_models():
         torch_dtype=torch.float32
     ).to(device)
 
-    # ✅ TTS pipeline (may fail on low memory)
+    # ✅ Smaller TTS model
     try:
-        tts = pipeline("text-to-speech", model="facebook/mms-tts-eng")
+        tts = pipeline("text-to-speech", model="espnet/kan-bayashi_ljspeech_vits")
     except Exception:
         tts = None  # fallback mode
     return blip_processor, blip_model, text_tokenizer, text_model, tts
@@ -81,13 +81,21 @@ def story_to_audio(story_text):
     if tts is None:
         return None
     try:
-        audio_out = tts(story_text)
-        samples = audio_out["audio"]
-        rate = audio_out["sampling_rate"]
-        buf = io.BytesIO()
-        sf.write(buf, samples, rate, format="WAV")
-        buf.seek(0)
-        return buf.read()
+        # ✅ Chunk long stories to avoid memory spikes
+        sentences = story_text.split(". ")
+        audio_buffers = []
+        for chunk in sentences:
+            if not chunk.strip():
+                continue
+            audio_out = tts(chunk.strip())
+            samples = audio_out["audio"]
+            rate = audio_out["sampling_rate"]
+            buf = io.BytesIO()
+            sf.write(buf, samples, rate, format="WAV")
+            buf.seek(0)
+            audio_buffers.append(buf.read())
+        # Concatenate audio chunks
+        return b"".join(audio_buffers)
     except Exception:
         return None
 
