@@ -11,8 +11,7 @@ from PIL import Image
 import io
 import soundfile as sf
 
-# ✅ Force CPU mode to reduce memory usage
-device = torch.device("cpu")
+
 
 # -----------------------------------------------------------
 # Function: load_models
@@ -59,7 +58,6 @@ def img2text(image_file):
 # -----------------------------------------------------------
 # Function: generate_story
 # Purpose: Generate a bedtime story based on the image caption
-# Fix: Use natural storytelling prompt so output feels like a parent telling a story
 # -----------------------------------------------------------
 def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model, device=device):
     def run_prompt(prompt):
@@ -74,20 +72,24 @@ def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model
         )
         return text_tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-    # ✅ Warm, narrative-style prompt
+    # ✅ Parental narrator prompt
     prompt = (
-        f"Tell a gentle bedtime story for children aged 3–10. "
-        f"Begin with 'Once upon a time' and make it sound like a parent speaking softly. "
-        f"The story should be about {caption}, with a beginning, middle, and happy ending."
+        f"Tell a gentle bedtime story as if a parent is speaking to their child. "
+        f"Begin with 'Once upon a time, my dear' and use warm, caring language. "
+        f"The story should be about {caption}, with a clear beginning, middle, and happy ending. "
+        f"Speak directly to the child with phrases like 'little one' or 'sweetheart'. "
+        f"Do not always start with 'The boy' or 'The girl'. "
+        f"End with a comforting line such as 'and now you can rest peacefully, knowing everything is safe and happy.'"
     )
     story = run_prompt(prompt)
 
-    # ✅ Retry with simpler narrative if output is meta-text
+    # ✅ Retry with simpler parental voice if output is meta-text
     bad_phrases = ["series", "post", "collection", "book"]
     if any(bp in story.lower() for bp in bad_phrases):
         retry_prompt = (
-            f"Once upon a time, there was {caption}. "
-            f"Tell it as a short bedtime story with a happy ending, like a parent speaking to a child."
+            f"Once upon a time, my dear, there was {caption}. "
+            f"Tell it as a short bedtime story in a parent's gentle voice, "
+            f"ending with comfort and happiness."
         )
         story = run_prompt(retry_prompt)
 
