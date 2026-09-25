@@ -20,14 +20,12 @@ device = torch.device("cpu")
 # -----------------------------------------------------------
 @st.cache_resource
 def load_models():
-    # BLIP model for image captioning
     blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
     blip_model = BlipForConditionalGeneration.from_pretrained(
         "Salesforce/blip-image-captioning-base",
         torch_dtype=torch.float32
     ).to(device)
 
-    # Instruction-tuned lightweight text model (Flan-T5-small)
     text_model_id = "google/flan-t5-small"
     text_tokenizer = AutoTokenizer.from_pretrained(text_model_id)
     text_model = AutoModelForSeq2SeqLM.from_pretrained(
@@ -35,15 +33,12 @@ def load_models():
         torch_dtype=torch.float32
     ).to(device)
 
-    # Smaller TTS model for audio generation
     try:
         tts = pipeline("text-to-speech", model="espnet/kan-bayashi_ljspeech_vits")
     except Exception:
-        tts = None  # fallback mode if TTS fails
-
+        tts = None
     return blip_processor, blip_model, text_tokenizer, text_model, tts
 
-# Load models once and reuse
 blip_processor, blip_model, text_tokenizer, text_model, tts = load_models()
 
 # -----------------------------------------------------------
@@ -73,7 +68,6 @@ def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model
         )
         return text_tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-    # ✅ Natural storytelling prompt — no repeated directives
     prompt = (
         f"Once upon a time, my dear, let me tell you a gentle bedtime story. "
         f"This story is about {caption}. "
@@ -83,7 +77,6 @@ def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model
     )
     story = run_prompt(prompt)
 
-    # ✅ Retry with simpler parental voice if output is meta-text
     bad_phrases = ["series", "post", "collection", "book", "illustration"]
     if any(bp in story.lower() for bp in bad_phrases):
         retry_prompt = (
@@ -98,7 +91,6 @@ def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model
 # -----------------------------------------------------------
 # Function: story_to_audio
 # Purpose: Convert the generated story into audio using TTS
-# Splits long stories into chunks to avoid memory issues
 # -----------------------------------------------------------
 def story_to_audio(story_text):
     if tts is None:
@@ -123,45 +115,46 @@ def story_to_audio(story_text):
 # -----------------------------------------------------------
 # Function: main
 # Purpose: Build the Streamlit UI for the app
-# Handles image upload, caption generation, story creation, and audio playback
 # -----------------------------------------------------------
 def main():
     st.set_page_config(page_title="Kids Story Generator", page_icon="📖", layout="centered")
 
-    # Title and description
+    # 🎨 Kid-friendly header
     st.markdown(
-        "<h1 style='text-align:center; color:#FF69B4;'>✨ Magical Story Generator ✨</h1>",
+        "<h1 style='text-align:center; color:#FF69B4;'>🌟 Magical Storytime 🌟</h1>",
         unsafe_allow_html=True
     )
     st.markdown(
-        "<p style='text-align:center; color:#228B22; font-size:20px;'>Upload a picture and hear your bedtime story!</p>",
+        "<p style='text-align:center; color:#228B22; font-size:22px;'>Upload a picture and let’s create a bedtime adventure together!</p>",
         unsafe_allow_html=True
     )
 
-    # File uploader
-    uploaded_file = st.file_uploader("📷 Upload an image", type=["jpg", "jpeg", "png"])
+    uploaded_file = st.file_uploader("📷 Choose a fun picture", type=["jpg", "jpeg", "png"])
     if uploaded_file is not None:
         image = Image.open(uploaded_file)
-        st.image(image, caption="Your Picture", use_container_width=True)
+        st.image(image, caption="✨ Your Picture ✨", use_container_width=True)
 
-        # Generate story button
-        if st.button("Generate Story"):
+        if st.button("🎉 Generate Story"):
             caption = img2text(uploaded_file)
-            st.success(f"📝 Caption: {caption}")
+            st.success(f"📝 Magic Caption: {caption}")
 
-            story = generate_story(caption)
+            # 🕒 Show friendly waiting message while story loads
+            with st.spinner("✨ Hold on tight! Your magical bedtime story is being written... ✨"):
+                story = generate_story(caption)
+
+            # Display story in a playful box
             st.markdown(
-                f"<div style='background-color:#FFFACD; padding:15px; border-radius:10px;'>"
-                f"<b>📖 Story:</b><br>{story}</div>",
+                f"<div style='background-color:#FFFACD; padding:20px; border-radius:15px; font-size:18px;'>"
+                f"<b>📖 Your Story:</b><br>{story}</div>",
                 unsafe_allow_html=True
             )
 
-            # Generate audio
             audio_bytes = story_to_audio(story)
             if audio_bytes:
                 st.audio(audio_bytes, format="audio/wav")
+                st.info("🔊 Sit back, relax, and listen to your magical story!")
             else:
-                st.warning("🔊 Audio unavailable due to memory limits. Please enjoy reading the story!")
+                st.warning("🔊 Audio unavailable right now, but you can enjoy reading the story!")
 
 # -----------------------------------------------------------
 # Entry point
