@@ -1,7 +1,9 @@
-streamlit>=1.32.0
-torch>=2.0.0
-transformers>=4.40.0
-huggingface-hub>=0.22.0
-numpy>=1.24.0
-soundfile>=0.12.1
-Pillow>=10.0.0
+streamlit==1.32.0
+torch==2.0.0
+transformers==4.40.0
+huggingface-hub==0.22.0
+numpy==1.24.0
+soundfile==0.12.1
+pillow==10.0.0
+sentencepiece==0.1.99
+protobuf==4.25.0
