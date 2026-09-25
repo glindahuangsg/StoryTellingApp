@@ -18,14 +18,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ----------------------------
 # Load models once (cache)
 # ----------------------------
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_models():
+    # BLIP image captioning
     blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
     blip_model = BlipForConditionalGeneration.from_pretrained(
         "Salesforce/blip-image-captioning-base",
         torch_dtype=torch.float16 if device.type == "cuda" else torch.float32
     ).to(device)
 
+    # Text generation (Qwen small)
     text_model_id = "Qwen/Qwen2.5-0.5B-Instruct"
     text_tokenizer = AutoTokenizer.from_pretrained(text_model_id)
     if text_tokenizer.pad_token_id is None:
@@ -35,12 +37,14 @@ def load_models():
         torch_dtype=torch.float16 if device.type == "cuda" else torch.float32
     ).to(device)
 
-    # Hugging Face pipeline for TTS (simpler for Streamlit deployment)
+    # Hugging Face TTS pipeline
     tts = pipeline("text-to-speech", model="facebook/mms-tts-eng")
 
     return blip_processor, blip_model, text_tokenizer, text_model, tts
 
-blip_processor, blip_model, text_tokenizer, text_model, tts = load_models()
+# Load models with a friendly spinner
+with st.spinner("Loading models... please wait"):
+    blip_processor, blip_model, text_tokenizer, text_model, tts = load_models()
 
 # ----------------------------
 # Helper functions
@@ -80,16 +84,20 @@ st.write("Upload an image and let the app create a magical story with audio narr
 uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file:
+    # 1. Show uploaded image
     st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
 
+    # 2. Image → Caption
     caption = img2text(uploaded_file)
     st.subheader("Generated Caption")
     st.write(caption)
 
+    # 3. Caption → Story
     story = generate_story(caption)
     st.subheader("Generated Story")
     st.write(story)
 
+    # 4. Story → Audio
     audio_bytes = story_to_audio(story)
     st.subheader("Audio Narration")
     st.audio(io.BytesIO(audio_bytes), format="audio/wav")
