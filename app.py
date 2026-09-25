@@ -97,20 +97,22 @@ def main():
 
     uploaded_file = st.file_uploader("📷 Upload an image", type=["jpg", "jpeg", "png"])
     if uploaded_file is not None:
-        st.image(uploaded_file, caption="Your Picture", use_column_width=True)
-
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Your Picture", use_column_width=True)
+    
         if st.button("Generate Story"):
-            caption = img2text(uploaded_file)
+            caption = img2text(uploaded_file)  # still pass the file object to your function
             st.success(f"📝 Caption: {caption}")
-
+    
             story = generate_story(caption)
             st.markdown(
                 f"<div style='background-color:#FFFACD; padding:15px; border-radius:10px;'><b>📖 Story:</b><br>{story}</div>",
                 unsafe_allow_html=True
             )
-
+    
             audio_bytes = story_to_audio(story)
             st.audio(audio_bytes, format="audio/wav")
+
 
 if __name__ == "__main__":
     main()
