@@ -72,12 +72,13 @@ def generate_story(description, age_group, story_style):
     tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL)
     model = AutoModelForCausalLM.from_pretrained(TEXT_MODEL).to(DEVICE).eval()
 
+    # Age-specific length
     lengths = {
-        "3–5": (120, "Use 3–5 very short sentences with simple words."),
-        "6–7": (160, "Use 5–7 short sentences with playful descriptions."),
-        "8–10": (200, "Use 7–10 sentences with imaginative language."),
+        "3–5": (150, "Tell a short bedtime story in 4–6 sentences using very simple words."),
+        "6–7": (180, "Tell a playful story in 6–8 sentences with simple descriptions."),
+        "8–10": (220, "Tell an imaginative story in 8–10 sentences with easy-to-understand language."),
     }
-    max_tokens, length_instruction = lengths.get(age_group, (150, ""))
+    max_tokens, length_instruction = lengths.get(age_group, (180, ""))
 
     styles = {
         "🐉 Magical": "Make it a gentle magical adventure.",
@@ -87,15 +88,12 @@ def generate_story(description, age_group, story_style):
     }
     style_instruction = styles.get(story_style, "Make it a warm children's story.")
 
-    # Refined prompt: no “Write only the story:” line
+    # Refined prompt: direct storytelling
     prompt = f"""
-Write a children's bedtime story.
-Picture description: {description}
-Child age: {age_group}
+Once upon a time, {description}.
 {length_instruction}
 {style_instruction}
-Guidelines: keep it safe, warm, imaginative; no violence, weapons, frightening scenes, or adult topics.
-Begin directly with the story. Do not repeat instructions.
+Use simple, warm, imaginative language. Do not repeat instructions.
 End with a happy or reassuring feeling.
 """
 
@@ -105,25 +103,26 @@ End with a happy or reassuring feeling.
             **inputs,
             max_new_tokens=max_tokens,
             do_sample=True,
-            temperature=0.7,
+            temperature=0.8,
             top_p=0.9,
-            num_beams=3,  # beam search for coherence
+            num_beams=4,  # beam search for coherence
+            min_length=80,  # enforce minimum length
         )
 
     story = tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
-    # Post‑processing: remove echoes
-    unwanted = ["Picture description:", "Child age:", "Guidelines:", "Write a children's bedtime story"]
-    for marker in unwanted:
-        if marker in story:
-            story = story.split(marker)[-1].strip()
+    # Remove any leftover prompt echoes
+    if story.lower().startswith("once upon a time"):
+        pass
+    else:
+        # force it to start like a children's story
+        story = "Once upon a time, " + story
 
     # Ensure it ends nicely
     if not story.endswith((".", "!", "?")):
         story += " And everyone was happy at the end."
 
     return story
-
 
 # ============================================================
 # TEXT → SPEECH
