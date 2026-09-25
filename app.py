@@ -4,7 +4,7 @@ from transformers import (
     BlipProcessor,
     BlipForConditionalGeneration,
     AutoTokenizer,
-    AutoModelForCausalLM,
+    AutoModelForSeq2SeqLM,
     pipeline
 )
 from PIL import Image
@@ -23,12 +23,10 @@ def load_models():
         torch_dtype=torch.float32
     ).to(device)
 
-    # ✅ Lightweight text model
-    text_model_id = "distilgpt2"
+    # ✅ Instruction-tuned lightweight text model
+    text_model_id = "google/flan-t5-small"
     text_tokenizer = AutoTokenizer.from_pretrained(text_model_id)
-    if text_tokenizer.pad_token_id is None:
-        text_tokenizer.pad_token_id = text_tokenizer.eos_token_id
-    text_model = AutoModelForCausalLM.from_pretrained(
+    text_model = AutoModelForSeq2SeqLM.from_pretrained(
         text_model_id,
         torch_dtype=torch.float32
     ).to(device)
@@ -50,7 +48,7 @@ def img2text(image_file):
     return blip_processor.decode(out[0], skip_special_tokens=True)
 
 def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model, device=device):
-    prompt = f"Tell a short bedtime story for kids about: {caption}. End happily."
+    prompt = f"Write a short bedtime story for children aged 3–10 about: {caption}. End happily."
     inputs = text_tokenizer(prompt, return_tensors="pt").to(device)
     output = text_model.generate(
         **inputs,
@@ -58,18 +56,14 @@ def generate_story(caption, text_tokenizer=text_tokenizer, text_model=text_model
         min_length=50,
         do_sample=True,
         temperature=0.8,
-        top_p=0.9,
-        pad_token_id=text_tokenizer.eos_token_id,
+        top_p=0.9
     )
-    full_text = text_tokenizer.decode(output[0], skip_special_tokens=True).strip()
-    if full_text.startswith(prompt):
-        story = full_text[len(prompt):].strip()
-    else:
-        story = full_text
-    if not story.endswith((".", "!", "?")):
-        last_period = story.rfind(".")
-        if last_period != -1:
-            story = story[:last_period+1]
+    story = text_tokenizer.decode(output[0], skip_special_tokens=True).strip()
+
+    # ✅ Fallback if model outputs irrelevant text
+    if "series" in story.lower() or "post" in story.lower():
+        story = "Once upon a time, children played happily in the park. They laughed, shared, and learned kindness. As the sun set, they went home with smiles, ready for sweet dreams."
+
     return story
 
 def story_to_audio(story_text):
